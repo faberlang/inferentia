@@ -30,8 +30,10 @@ The SmolLM2 hash and size **cross-validate** against faber-runtime
 ## 2. GGUF metadata (parsed live, 2026-08-09)
 
 Read-only parse of the GGUF header (LE binary walk); data offsets
-cross-validated against `/opt/homebrew/bin/llama-gguf r` (version 10150,
-`dee2a846b`) — identical values.
+cross-validated against `/opt/homebrew/bin/llama-gguf` (version 10150,
+`dee2a846b`) — identical values. (10150 argument order is `llama-gguf <file>
+r`, not `r <file>`; the tool prints key names, not values — the values below
+come from the LE walk.)
 
 ### 2.1 SmolLM2-360M-Instruct-Q4_K_M
 
@@ -154,7 +156,7 @@ The physical engine for the pinned SmolLM2 row exists in **Rust**
 | Surface | Verified |
 | --- | --- |
 | `model_format::admit_pinned(bytes)` / `admit_pinned_file(path) → PinnedAdmission` | Pinned row only: 37 KV, 290 tensors, whole-file SHA-256 `2fa3f013…`, size 270,590,880, GGUF v3, file_type 15, quant v2. 34 admission tests green (GI1). |
-| `model_widen::TensorView::build(&PinnedAdmission, &bytes)` | Coverage-gated (`coverage_ok`); per-tensor descriptors + receipts. |
+| `tensor_view::TensorView::build(&PinnedAdmission, &bytes)` | Lives in `src/tensor_view.rs` (struct at `tensor_view.rs:209`, `build` at `tensor_view.rs:244`); consumed by `model_widen` for coverage-gating (`coverage_ok`); per-tensor descriptors + receipts. |
 | `cpu_oracle::CpuOracle::build(&view)` → `forward_one(&[i64]) → Vec<f32>` (full-vocab logits) | 32-layer decoder (RMSNorm · RoPE NORM · GQA 15/5 · SwiGLU · dense); tied-head projection. GI2: byte-identical to the reference executor. |
 | `ForwardRun` (incremental, per-position K/V) | No numeric change vs full forward. |
 | `top1_non_eog(logits, &[0,2])` | Greedy over non-EOG. |
@@ -204,8 +206,9 @@ HTTP client verbs in `norma:http` (`petet`, `mittet`, `ponet`, `delet`,
   `ad` route prefix (`http:…` → `http`, `solum:…` → `solum`, …) and generates
   a `main` + `host_register` that registers them with the kernel when the
   package declares native host bootstrap (`[target.rust] host = "native"`).
-  Evidence: `faber/src/package/rust_target.rs` + `dispatch.rs`
-  (`selected_providers_for_routes`, `load_provider_manifests`).
+  Evidence: `faber/src/package/dispatch.rs`
+  (`selected_providers_for_routes` at `dispatch.rs:28`,
+  `load_provider_manifests` at `dispatch.rs:146`).
 
 ### 5.3 JSON and TOML — deferred (gaps)
 
@@ -232,21 +235,48 @@ HTTP client verbs in `norma:http` (`petet`, `mittet`, `ponet`, `delet`,
 ### 6.2 Oracle commands (llama.cpp 10150 `dee2a846b`, comparison-only)
 
 ```sh
-# tokenizer probe parity (P10)
+# tokenizer probe parity (P10) — reproduces the frozen prompt tokens exactly
 /opt/homebrew/bin/llama-tokenize -m \
   /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
-  -p "The quick brown fox jumps over the lazy dog"
+  -p "The quick brown fox jumps over the lazy dog" --ids
+# → [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767] (verified 2026-08-09)
 
-# greedy generation oracle
-/opt/homebrew/bin/llama-cli -m \
-  /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
-  -p "The quick brown fox jumps over the lazy dog" -n 16 --temp 0 --seed 1 \
-  --no-display-prompt
+# greedy generation oracle — pinned token-array /completion form (reproduces record.json)
+# 1) start the pinned comparator server (launch flags from radix GI0 comparator contract §2)
+/opt/homebrew/bin/llama-server --host 127.0.0.1 --port <FREE_PORT> \
+  --model /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
+  --parallel 1 --batch-size 1024 --ubatch-size 256 --ctx-size 8192 \
+  --cache-type-k f16 --cache-type-v f16 --flash-attn on \
+  --n-gpu-layers 99 --threads 6 --threads-batch 6 \
+  --jinja --mmap --reasoning off --reasoning-budget 0
+
+# 2) once GET /health returns {"status":"ok"}, post the token-id prompt:
+curl -s http://127.0.0.1:<FREE_PORT>/completion -H 'Content-Type: application/json' \
+  -d '{"prompt":[504,2365,6354,16438,27003,690,260,23790,2767],"n_predict":16,"temperature":0,"seed":42,"top_k":40,"top_p":0.95,"min_p":0.05,"typical_p":1.0,"repeat_penalty":1.0,"ignore_eos":true,"stop":[],"stream":false,"cache_prompt":false,"n_probs":40}'
+# trace head = completion_probabilities[i].id (top-1 per position) →
+#   [30,198,198,504,808,6330,314,253,2232,4814,282,1027,28,979,260,1796]
+#   (verified 2026-08-09: exact match with record.json generated_tokens[0..16])
 ```
 
-Exact `llama-cli` flag spellings for token-level output (`-j`/`--log-json`,
-`--verbose-prompt`) are verified at I1 execution time and recorded in the
-validation log; `evidence/contract-tokenize-probes.txt` +
+**Divergence (recorded, not hidden)**: the text-prompt `llama-cli -p` form
+does **not** reproduce the record. llama-cli 10150 defaults to conversation
+mode for instruct models whose metadata carries a chat template (this row's
+ChatML), so the frozen prompt is wrapped in `<|im_start|>…` and the model
+answers `I'm sorry for the confusion, but as an AI trained by Hugging Face`
+(first token 40) instead of the record's `[30,198,198,504,…]` — verified
+2026-08-09 in both default and `-no-cnv` modes. The frozen record was
+produced through the **token-array server form** above (gi0 comparator
+contract §4): token-id prompt, no template, no implicit BOS (row
+`add_bos_token=false`), temperature 0, `ignore_eos: true`, seed 42.
+`testdata/gi2-4-greedy-record/record.json` is the **gate authority**; the
+oracle command is a comparison record that reproduces it.
+
+Flag note: `-j` in llama.cpp 10150 means `--json-schema` (schema-constrained
+generation), **not** JSON log output, and no `--log-json` flag exists in this
+build. Token-level observation is done through the `/completion` response
+`completion_probabilities[i].id` (top-1 id per position; `n_probs` is a
+recording knob that does not change sampling) and `llama-cli --verbose-prompt`
+for prompt-token display. `evidence/contract-tokenize-probes.txt` +
 `testdata/gi2-4-greedy-record/record.json` are the committed comparison
 authority. Qwen oracle runs are produced fresh at execution time for the
 batch gate and recorded in the validation log.

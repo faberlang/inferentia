@@ -6,8 +6,11 @@
 **Companion evidence**: [`i1-discovery.md`](i1-discovery.md) — every fact below
 traces to live verification recorded there.
 **Baseline**: inferentia repo clean at `ed845e6`; gradus HEAD `24feb82`;
-faber-runtime HEAD `3e2f8d9`; faber 1.5.0; llama.cpp 10150 `dee2a846b`
-(oracle only).
+faber-runtime HEAD `3e2f8d9`; faber 1.5.0 — **the spec targets released tag
+`v1.5.0`** (the version I0's `faber check .` validated on; faber HEAD has
+since moved to 1.6.0-rc.1 at `v1.5.0-91-g3b36fb8`, and the execution-time
+validation log re-pins the exact faber version used); llama.cpp 10150
+`dee2a846b` (oracle only).
 
 ---
 
@@ -50,7 +53,8 @@ gaps become blocking deliveries in their owning repos; deployment stays out.
   identity, decode/cache/sampling/generation contracts — compile-validated,
   runtime env-blocked.
 - **faber-runtime**: pinned-row admission (`model_format`), tensor view
-  (`model_widen`), 32-layer CPU decoder (`cpu_oracle`), greedy record
+  (`tensor_view::TensorView::build`, coverage-gated via `model_widen`),
+  32-layer CPU decoder (`cpu_oracle`), greedy record
   (256 tokens, all_agree), GI2 goldens — Rust-tested. No tokenizer runtime
   (removed PML2 C3), no execution bridge to Faber apps.
 - **hosts**: `http` (loopback, single request, no streaming), `solum` (file
@@ -89,8 +93,10 @@ server flags < request body**. No config file in I1 (`norma:toml` deferred);
 the precedence position for a future file layer is reserved between
 documented constants and server flags. Request-body fields override server
 flags per request; absent body fields inherit server flags; absent flags
-inherit defaults. `max_tokens`/`context`/`seed` from flags are ceilings/
-defaults, never per-request overrides of explicitly-supplied values.
+inherit defaults. Flag-supplied `max_tokens`/`context`/`seed` are server
+defaults and ceilings: a per-request body value (where a body field exists)
+always overrides a flag; flags never override an explicitly-supplied body
+field.
 
 ### D3 — Minimum HTTP endpoints and schemas
 
@@ -107,6 +113,14 @@ All responses JSON; loopback HTTP/1.1; one request at a time.
   `top_k`, `top_p`, `min_p`, `poena_repetitionis`); unknown or out-of-domain
   fields are rejected (`imperium_admissum` reject rows — fail closed, never
   silently ignored).
+- **Sourcing (all nine fields pinned)**: `magna_promptus` ← the request body
+  `prompt` field — the only text in I1, passed raw to prefill (no chat
+  template); `maxima_verborum` ← body `max_tokens` (server `--max-tokens`
+  default per D2/D4); `contextus` ← the `--context` flag (default = model
+  `context_length`, D1 — no body field); `semen` ← body `seed` (server
+  `--seed` default); `temperatura`/`top_k`/`top_p`/`min_p`/
+  `poena_repetitionis` ← their body fields (deterministic-greedy defaults per
+  D4 when absent). Body fields override flags per D2; flags override defaults.
 - `prompt` is the only text in I1; generated `text` is the raw detokenized
   output (no chat template — the metadata chat templates are recorded, not
   applied).
@@ -251,7 +265,7 @@ schemas). Triggered by a second caller; becomes a required prerequisite in I2.
 | **U2** Admission at startup + health lifecycle | Listener binds first; `admit` runs before allocation; `/health` shows `starting` then `ready` with model identity; admission failure (missing file, truncated copy, digest-mismatch fixture) → `failed` state + exit 2 on shutdown; no weight materialization on failure | Unit tests over the admission path; manual curl against live server; failure fixtures from local copies (truncate/corrupt in a test tmpdir) |
 | **U3** `/model` endpoint | Response schema per D3 from capsule + admission facts (name, arch, quant, size, sha256, context, vocab, max_output_tokens, backend `cpu`) | curl `/model` → exact JSON vs committed expected body; 503 before ready |
 | **U4** `/generate` endpoint | Request parse (minimal product JSON), field validation via gradus reject-rows, generation loop: encode → prefill → decode/greedy loop with EOG stop {0,2}, `max_tokens` budget, cancellation checkpoints; second sequential request succeeds **without reloading weights** (resident-model proof) | curl frozen fixture request → ≥ 16 tokens; two sequential requests; stderr shows one load |
-| **U5** Oracle match (tokenization + greedy) | P10 encodes to `[504,…,2767]`; generated token ids equal `record.json generated_tokens[0..16]` **exactly** (documented tolerance: exact, GI2 §4.1 top-1 non-EOG surface) | Compare against `record.json` + fresh `llama-cli`/`llama-tokenize` run recorded in validation log |
+| **U5** Oracle match (tokenization + greedy) | P10 encodes to `[504,…,2767]`; generated token ids equal `record.json generated_tokens[0..16]` **exactly** (documented tolerance: exact, GI2 §4.1 top-1 non-EOG surface) | Compare against `record.json` + a fresh **token-array oracle run** (pinned `/completion` invocation, discovery §6.2) + `llama-tokenize --ids` P10, recorded in validation log |
 | **U6** Shutdown + in-flight | SIGTERM during idle → exit 0; SIGTERM mid-request → in-flight request finishes or cancels at the checkpoint; listener closed (same port rebinds); second signal → exit 130 | Shell test sequence with `kill -TERM`, port rebind check, curl loop |
 | **U7** Admission-failure matrix | Malformed GGUF, wrong arch, wrong quant, digest mismatch, unknown key → typed failure before allocation, no listener behavior regression | Fixture matrix (local copies) driving each GgufError variant |
 | **U8** Validation-log capture | Cross-stage record complete: repo commits (inferentia, gradus, faber-runtime, hosts, faber), exact commands, model path/size/hash, request fixture + bodies, stdout/stderr, HTTP statuses, process-lifetime + shutdown evidence, oracle command + plain match statement | `docs/factory/inferentia/i1-validation.md` committed with Slice-1 gate run |
@@ -312,8 +326,10 @@ schemas). Triggered by a second caller; becomes a required prerequisite in I2.
 - Owning-repo blocking deliveries: `cargo check -p <crate>` + single-crate
   `cargo nextest run` (faber-runtime/hosts), `faber test` (gradus proba, no
   cargo), per BD proofs.
-- Oracle runs are recorded, never authoritative: `llama-tokenize` /
-  `llama-cli` 10150 `dee2a846b` with fixed flags in the validation log.
+- Oracle runs are recorded, never authoritative: `llama-tokenize --ids`
+  (tokenizer probes) and the pinned token-array `/completion` oracle (greedy,
+  discovery §6.2) on llama.cpp 10150 `dee2a846b` with fixed flags in the
+  validation log.
 - Expected model-side cost (AGENTS.md): Slice-1 full gate run is a small
   model (270 MB, CPU) — minutes, not hours. The GI2 greedy reference (~64 s
   release) bounds the comparable oracle run.
