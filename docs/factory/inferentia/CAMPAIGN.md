@@ -83,7 +83,10 @@ Completion gate:
 
 ## I1 — Small GGUF vertical slice
 
-**State**: selected next; discovery-first delivery specification required
+**State**: delivery specification ready — [`i1-delivery.md`](i1-delivery.md) +
+[`i1-discovery.md`](i1-discovery.md) (planned, 2026-08-09); implementation
+blocked on named prerequisite deliveries (BD-1 tokenizer runtime, BD-2
+execution bridge, BD-3 library execution, BD-4 Qwen row contract)
 
 ### Goal
 
