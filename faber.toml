@@ -11,5 +11,8 @@ entry = "main.fab"
 target = "rust"
 kind = "bin"
 
+[target.rust]
+host = "native"
+
 [locale]
 locale = "en"

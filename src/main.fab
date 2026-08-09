@@ -1,5 +1,271 @@
-@ cli "inferentia"
-@ versio "0.1.0"
-@ description "Local-first GGUF inference server written in Faber"
-main args args {
+# =============================================================================
+# Inferentia — local GGUF inference server (I1 U1)
+# =============================================================================
+#
+# U1 scope: `serve` CLI parsing (D1), configuration precedence (D2), and host
+# bootstrap — bind a loopback listener, answer `/health`, and exit on usage
+# errors before any listener binds.
+#
+# The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
+# no streaming. The `norma:http` server wrappers are not yet wired into the
+# Rust backend, so the provider routes are called directly here.
+#
+# The generated CLI framework is not used: its help/parse errors exit 0/2 and
+# cannot carry the D5 usage-error exit, so argv is parsed in this unit and
+# every usage error is detected before the listener binds.
+
+# ---------------------------------------------------------------------------
+# Serve configuration (D1 syntax + D2 precedence)
+#
+# Documented constants are the defaults; server flags override them. `context`
+# uses 0 as the "derive from the model's context_length" sentinel (the model is
+# admitted in U2+); an explicit `--context 0` is rejected as a config error.
+# ---------------------------------------------------------------------------
+class ServeConfig {
+    string model
+    string host
+    int port
+    int max_tokens
+    int context
+    int seed
+    string log_level
+}
+
+# ---------------------------------------------------------------------------
+# Host provider routes (physical effects live behind the hosts kernel)
+# ---------------------------------------------------------------------------
+
+# Bind a loopback HTTP/1.1 listener and return its opaque handle.
+fn http_listen(int port) → int {
+    return call 'http:listen' ([port]) ↦ int
+}
+
+# Accept one bounded request; the carrier is a map with id/method/path/headers/body.
+fn http_accept(int handle) → value {
+    return call 'http:accept' (handle) ↦ value
+}
+
+# Write one response for a pending request id.
+fn http_respond_raw(list<value> args) → void {
+    return call 'http:respond' (args) ↦ void
+}
+
+fn http_respond(string request_id, int status, string body) → void {
+    const list<map<string, string>> headers ← [{"name": "content-type", "value": "application/json"}]
+    http_respond_raw([request_id, status, headers, body])
+}
+
+# Write text to stdout without a trailing newline.
+fn stdout_write(string text) → void {
+    return call 'consolum:dic' (text) ↦ void
+}
+
+# Write a line to stderr.
+fn stderr_write(string text) → void {
+    return call 'consolum:mone' (text) ↦ void
+}
+
+# ---------------------------------------------------------------------------
+# Usage errors (D5): detected before any listen, non-zero exit.
+# ---------------------------------------------------------------------------
+fn usage_error(string message) → never {
+    stderr_write("error: " + message)
+    panic "usage error"
+}
+
+# ---------------------------------------------------------------------------
+# CLI parsing (D1)
+# ---------------------------------------------------------------------------
+
+# Parse a base-10 integer; -1 when the text is not a valid integer.
+# (-1 is never a legal value for any D1 numeric option.)
+fn parse_int(string raw) → int {
+    return raw ↦ int ⇥ -1
+}
+
+# The D1 `serve` syntax, printed on `--help`.
+fn print_help() → void {
+    stdout_write("Usage: inferentia serve [OPTIONS]\n")
+    stdout_write("\n")
+    stdout_write("Local-first GGUF inference server written in Faber\n")
+    stdout_write("\n")
+    stdout_write("Options:\n")
+    stdout_write("  -m, --model <PATH>        Path to the GGUF model file (required)\n")
+    stdout_write("      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)\n")
+    stdout_write("      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)\n")
+    stdout_write("      --max-tokens <N>      Default output token ceiling (default: 32)\n")
+    stdout_write("      --context <N>         Session context ceiling (default: model limit)\n")
+    stdout_write("      --seed <N>            Deterministic seed (default: 1)\n")
+    stdout_write("      --log-level <LEVEL>   stderr verbosity: info|warn|error (default: info)\n")
+    stdout_write("  -h, --help                Print help\n")
+    stdout_write("      --version             Print version\n")
+}
+
+# Parse argv (program name included at index 0) into a ServeConfig.
+# Every usage error exits before returning.
+fn parse_cli(list<string> argv) → ServeConfig {
+    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, context = 0, seed = 1, log_level = "info" }
+    var string subcommand ← ""
+    var int i ← 1
+
+    while i < argv.longitudo() {
+        const string arg ← argv.accipe(i) coalesce ""
+        if arg ≡ "--help" or arg ≡ "-h" {
+            print_help()
+            panic "help requested"
+        }
+        elif arg ≡ "--version" {
+            stdout_write("inferentia 0.1.0\n")
+            panic "version requested"
+        }
+        elif arg ≡ "--model" or arg ≡ "-m" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --model")
+            config.model ← argv.accipe(i) coalesce ""
+        }
+        elif arg ≡ "--host" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --host")
+            config.host ← argv.accipe(i) coalesce ""
+        }
+        elif arg ≡ "--port" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --port")
+            const string raw ← argv.accipe(i) coalesce ""
+            const int port ← parse_int(raw)
+            if port < 0 or port > 65535 then usage_error("invalid port '" + raw + "' (expected 0..=65535)")
+            config.port ← port
+        }
+        elif arg ≡ "--max-tokens" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --max-tokens")
+            const string raw ← argv.accipe(i) coalesce ""
+            const int value ← parse_int(raw)
+            if value < 1 then usage_error("invalid max-tokens '" + raw + "' (expected >= 1)")
+            config.max_tokens ← value
+        }
+        elif arg ≡ "--context" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --context")
+            const string raw ← argv.accipe(i) coalesce ""
+            const int value ← parse_int(raw)
+            if value < 1 then usage_error("invalid context '" + raw + "' (expected >= 1)")
+            config.context ← value
+        }
+        elif arg ≡ "--seed" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --seed")
+            const string raw ← argv.accipe(i) coalesce ""
+            const int value ← parse_int(raw)
+            if value < 1 then usage_error("invalid seed '" + raw + "' (expected >= 1)")
+            config.seed ← value
+        }
+        elif arg ≡ "--log-level" {
+            i ← i + 1
+            if i ≥ argv.longitudo() then usage_error("missing value for --log-level")
+            const string raw ← argv.accipe(i) coalesce ""
+            if (raw ≡ "info") or (raw ≡ "warn") or (raw ≡ "error") {
+                config.log_level ← raw
+            } else {
+                usage_error("invalid log-level '" + raw + "' (expected info|warn|error)")
+            }
+        }
+        elif arg.initium("-") and arg.longitudo() > 1 {
+            usage_error("unknown option '" + arg + "'")
+        }
+        else {
+            if subcommand ≡ "" {
+                subcommand ← arg
+            } else {
+                usage_error("unexpected operand '" + arg + "'")
+            }
+        }
+        i ← i + 1
+    }
+
+    if subcommand ≡ "" then usage_error("missing subcommand 'serve'")
+    if subcommand ≡ "serve" {
+        # ok — serve is the only subcommand in I1 (D1)
+    } else {
+        usage_error("unknown subcommand '" + subcommand + "'")
+    }
+    if config.model ≡ "" then usage_error("missing required option --model")
+
+    return config
+}
+
+# ---------------------------------------------------------------------------
+# Server loop (U1 proves the listener + CLI surface; the /health lifecycle and
+# request handling beyond path routing belong to U2+).
+# ---------------------------------------------------------------------------
+
+# Respond to one request carrier. /health is always 200 once the listener is
+# up; any other path is 404 (D3).
+fn handle_request(value request) → void {
+    if request is map<string, value> {
+        const map<string, value> tab ← request ↦ map<string, value>
+        const value vid ← tab.accipe("id")
+        const string id ← vid ↦ string
+        const value via ← tab.accipe("path")
+        const string path ← via ↦ string
+        if path ≡ "/health" {
+            http_respond(id, 200, "{\"state\":\"starting\"}")
+        } else {
+            http_respond(id, 404, "not found")
+        }
+    }
+}
+
+fn serve(ServeConfig config) → void {
+    const int listener ← http_listen(config.port)
+    stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
+    while true {
+        const value request ← http_accept(listener)
+        handle_request(request)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+main args argv {
+    const ServeConfig config ← parse_cli(argv)
+    serve(config)
+}
+
+# ---------------------------------------------------------------------------
+# Tests (pure parse-path coverage; error exits are proven by the binary)
+# ---------------------------------------------------------------------------
+describe "serve cli parse" tag "inferentia" {
+    test "documented constants apply when no server flags are given" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        assert cfg.host ≡ "127.0.0.1"
+        assert cfg.port ≡ 8080
+        assert cfg.max_tokens ≡ 32
+        assert cfg.seed ≡ 1
+        assert cfg.log_level ≡ "info"
+        assert cfg.model ≡ "/tmp/model.gguf"
+    }
+    test "server flags override documented constants" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
+        assert cfg.port ≡ 9090
+        assert cfg.max_tokens ≡ 16
+        assert cfg.seed ≡ 7
+        assert cfg.host ≡ "127.0.0.1"
+        assert cfg.log_level ≡ "warn"
+    }
+    test "port zero is ephemeral" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "0"])
+        assert cfg.port ≡ 0
+    }
+    test "short model flag binds the same option" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "-m", "/tmp/model.gguf"])
+        assert cfg.model ≡ "/tmp/model.gguf"
+    }
+    test "context is unset until a flag provides it" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        assert cfg.context ≡ 0
+        const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--context", "4096"])
+        assert cfg2.context ≡ 4096
+    }
 }
