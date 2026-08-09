@@ -1,0 +1,5 @@
+@ cli "inferentia"
+@ versio "0.1.0"
+@ description "Local-first GGUF inference server written in Faber"
+main args args {
+}
