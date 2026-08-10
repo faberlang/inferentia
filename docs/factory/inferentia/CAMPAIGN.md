@@ -1,6 +1,6 @@
 # Inferentia Master Campaign
 
-**Status**: planned — repository scaffolded; I1 is selected for delivery planning
+**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1 serve CLI (45e8ec1) + BD-2 execution bridge (6d42d8d) landed; U2/U4/U5 unblocked; delivery amendment in (2654530)
 
 ## Summary
 
