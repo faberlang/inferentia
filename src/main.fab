@@ -751,14 +751,16 @@ fn generate_response_body(ServerState st, list<int> tokens, list<int> prompt_ids
     const int cn ← tokens.longitudo()
     const int total ← pn + cn
     const string reason ← finish_reason(cn, max_tokens)
-    return "{\"model\":{\"sha256\":\"" + st.sha256 + "\",\"path\":\"" + st.model_path + "\"},\"text\":\"" + tokens_text(tokens) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
+    return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + tokens_text(tokens) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
 }
 
-# JSON-string escape for error bodies (the engine's typed causes carry
-# quotes, e.g. unknown config field "bogus"). Backslashes first, then
-# quotes — the reverse order would double the inserted backslashes.
+# JSON-string escape for health/error bodies (typed causes carry quotes,
+# e.g. unknown config field "bogus"; a configured model path may carry
+# backslashes; multi-line error text carries control characters). Escaping
+# order matters: backslashes first, then quotes, then control characters —
+# reversing the first two would double the inserted backslashes.
 fn json_escape(string s) → string {
-    return s.muta("\\", "\\\\").muta("\"", "\\\"")
+    return s.muta("\\", "\\\\").muta("\"", "\\\"").muta("\n", "\\n").muta("\r", "\\r").muta("\t", "\\t")
 }
 
 fn error_body(string error) → string {
@@ -825,6 +827,14 @@ fn stdout_write(string text) → void {
 # Write a line to stderr.
 fn stderr_write(string text) → void {
     return call 'consolum:mone' (text) ↦ void
+}
+
+# D5 exit-code delivery: terminate the process with the given code (0 clean
+# shutdown, 2 admission/load failure at shutdown). The route is the language's
+# process-exit primitive (`processus:exi`); never returns on success — the
+# generated wrapper panics if it returns.
+fn exit_with(int code) → void {
+    return call 'processus:exi' (code) ↦ void
 }
 
 # ---------------------------------------------------------------------------
@@ -962,7 +972,9 @@ fn parse_cli(list<string> argv) → ServeConfig {
 
 # The /health body per D3. The model identity on ready carries the verified
 # whole-file SHA-256 (the only identity fact the BD-2 admit route returns) and
-# the configured path; on failed it carries the typed cause.
+# the configured path; on failed it carries the typed cause. Every string
+# value is JSON-escaped so a configured path or a typed error can never
+# produce invalid JSON.
 # Note: the D3 `pid` field is not served — the toolchain has no process-
 # identity call form (empty-opener routes fail codegen; recorded gap).
 fn health_body(ServerState st) → string {
@@ -970,9 +982,9 @@ fn health_body(ServerState st) → string {
         return "{\"state\":\"starting\",\"model\":null}"
     }
     if st.state ≡ "failed" {
-        return "{\"state\":\"failed\",\"model\":{\"error\":\"" + st.error_text + "\"}}"
+        return "{\"state\":\"failed\",\"model\":{\"error\":\"" + json_escape(st.error_text) + "\"}}"
     }
-    return "{\"state\":\"ready\",\"model\":{\"sha256\":\"" + st.sha256 + "\",\"path\":\"" + st.model_path + "\"}}"
+    return "{\"state\":\"ready\",\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"}}"
 }
 
 # Handle a /generate request (U4). The pipeline: method gate → state gate →
@@ -1138,13 +1150,19 @@ fn serve(ServeConfig config) → void {
         }
     }
 
-    # Loop-end shutdown path (reachable when accept fails). The D5 exit-code
-    # decision maps failed admission to exit 2; the delivery seam is a
-    # recorded toolchain gap (processus:exi is unmanifested for the native
-    # host, and no signal handling is wired) — the executable exit-code proof
-    # runs in the admission-gate harness under tests/admission-gate/.
+    # Loop-end shutdown path (reachable when the listener stops / accept is
+    # cancelled). The D5 exit-code decision maps failed admission to exit 2
+    # and successful admission / clean shutdown to exit 0; the code is
+    # DELIVERED to the process via the processus:exi primitive (exit_with),
+    # not printed-and-panicked. Note: the native-host runtime delivery of
+    # processus:exi was broken at the time of this commit (plan-time classifies
+    # it as a builtin route; the native-host dispatch shadows the builtin and
+    # rejects it — scoped as a faber-runtime fix in the u2p1 closeout), and
+    # the loop-end trigger (SIGTERM → http:stop) is the recorded U6 signal
+    # gap. The executable exit-code proof for the harness paths runs under
+    # tests/admission-gate/ and tests/process-exit/.
     stderr_write("inferentia: shutting down (exit code " + (exit_code_for(state.state) ↦ string) + ")\n")
-    panic "inferentia: serve loop ended; intended exit code " + (exit_code_for(state.state) ↦ string)
+    exit_with(exit_code_for(state.state))
 }
 
 # ---------------------------------------------------------------------------
@@ -1156,9 +1174,11 @@ main args argv {
 }
 
 # ---------------------------------------------------------------------------
-# Tests (pure parse + lifecycle logic; error exits are proven by the binary;
-# the provider-touching admission path is executed by the admission-gate
-# harness under tests/admission-gate/ and proven by the in-tree BD-2 probe)
+# Tests (pure parse + lifecycle logic; process-exit statuses are proven by the
+# product binary under tests/process-exit/ — blocked on the scoped native-host
+# processus:exi runtime fix — and by the admission-gate harness under
+# tests/admission-gate/; the provider-touching admission path is executed by
+# the admission-gate harness and proven by the in-tree BD-2 probe)
 # ---------------------------------------------------------------------------
 describe "serve cli parse" tag "inferentia" {
     test "documented constants apply when no server flags are given" {
@@ -1223,6 +1243,30 @@ describe "health lifecycle" tag "inferentia" {
     test "health body failed carries typed cause" {
         const ServerState st ← failed(new_state("/missing.gguf"), "io error: No such file")
         assert health_body(st) ≡ "{\"state\":\"failed\",\"model\":{\"error\":\"io error: No such file\"}}"
+    }
+    test "json escape leaves plain text unchanged" {
+        assert json_escape("plain text") ≡ "plain text"
+    }
+    test "json escape escapes quotes and backslashes backslash-first" {
+        # The order matters: backslashes first, then quotes — the reverse
+        # order would double the inserted backslashes and leave the quote
+        # unescaped. `a"b\c` carries both characters.
+        assert json_escape("a\"b\\c") ≡ "a\\\"b\\\\c"
+    }
+    test "json escape escapes control characters" {
+        assert json_escape("line1\nline2\tend") ≡ "line1\\nline2\\tend"
+    }
+    test "health body ready escapes quotes and backslashes in the path" {
+        const ServerState st ← admitted(new_state("/models/a\"b\\c.gguf"), "2fa3f013")
+        assert health_body(st) ≡ "{\"state\":\"ready\",\"model\":{\"sha256\":\"2fa3f013\",\"path\":\"/models/a\\\"b\\\\c.gguf\"}}"
+    }
+    test "health body ready escapes control characters in the path" {
+        const ServerState st ← admitted(new_state("/models/x\nline.gguf"), "2fa3f013")
+        assert health_body(st) ≡ "{\"state\":\"ready\",\"model\":{\"sha256\":\"2fa3f013\",\"path\":\"/models/x\\nline.gguf\"}}"
+    }
+    test "health body failed escapes quotes and backslashes in the error" {
+        const ServerState st ← failed(new_state("/missing.gguf"), "io error: \"boom\" at \\tmp\\x")
+        assert health_body(st) ≡ "{\"state\":\"failed\",\"model\":{\"error\":\"io error: \\\"boom\\\" at \\\\tmp\\\\x\"}}"
     }
     test "exit code decision maps failed to 2" {
         assert exit_code_for("failed") ≡ 2

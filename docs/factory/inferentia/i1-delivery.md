@@ -167,6 +167,21 @@ All responses JSON; loopback HTTP/1.1; one request at a time.
   config error · `2` admission/load failure at shutdown · `130` forced second
   signal. Startup usage errors exit immediately with 1.
 
+**u2p1 recorded state (implement inferentia-u2p1-fix)**: the serve-loop-end
+path now DELIVERS `exit_code_for(state)` to the process via `exit_with`
+(the `processus:exi` primitive) instead of printing-then-panicking. Health and
+error bodies are JSON-escaped (`json_escape`), so a configured path or typed
+error can never produce invalid JSON. `starting` stays internal/unobservable
+(admission is synchronous before the accept loop). The product-binary
+process-status check (`tests/process-exit/`) is BLOCKED on two scoped
+toolchain gaps: (1) the faber-runtime native-host dispatch does not deliver
+`processus:exi` in `host = "native"` builds (the route is builtin-classified
+at plan time but shadowed by the installed NativeHost, and the unsupported-
+route rejection path deadlocks) — scoped as the faber-runtime dispatch fix;
+(2) the loop-end trigger (SIGTERM → `http:stop`) is the recorded U6 signal
+gap. The harness paths (tests/admission-gate/) deliver real exit codes 0/2
+today.
+
 ### D6 — Shutdown and in-flight behavior
 
 - SIGTERM/SIGINT → stop accepting (`http:stop` closes the listener and
