@@ -1,5 +1,5 @@
 # =============================================================================
-# Inferentia — local GGUF inference server (I1 U1 + U2)
+# Inferentia — local GGUF inference server (I1 U1 + U2 + U4)
 # =============================================================================
 #
 # U1 scope: `serve` CLI parsing (D1), configuration precedence (D2), and host
@@ -13,6 +13,15 @@
 # (digest verification first, then structure validation — the BD-2 execution
 # bridge over the faber-runtime pinned-row engine) is called; `forward` /
 # `generate` are never invoked here.
+#
+# U4 scope: the `/generate` endpoint — request parse (minimal product JSON
+# per D3), field validation via the gradus reject rows (imperium_admissum,
+# enforced by the pinned engine with typed causes), the generation pipeline
+# (encode → the engine's prefill + greedy decode with the pinned EOG stop set
+# {0,2} and the max_tokens budget), cancellation checkpoints (D6 seam), and
+# the resident-model proof (weights load exactly once; stderr records the
+# single load). The generation loop itself lives behind `model:generate`
+# (the BD-2 execution bridge); this unit owns the request pipeline around it.
 #
 # The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
 # no streaming. The `norma:http` server wrappers are not yet wired into the
@@ -51,27 +60,735 @@ class ServerState {
     string sha256
     string error_text
     string model_path
+    bool cancelled
 }
 
 # A fresh state is `starting` until admission runs (bind → admit → allocate).
 fn new_state(string model_path) → ServerState {
-    return ServerState { state = "starting", sha256 = "", error_text = "", model_path = model_path }
+    return ServerState { state = "starting", sha256 = "", error_text = "", model_path = model_path, cancelled = false }
 }
 
 # Functional transitions — Faber class parameters have value semantics, so a
 # transition returns a new state instead of mutating in place.
 fn admitted(ServerState st, string sha) → ServerState {
-    return ServerState { state = "ready", sha256 = sha, error_text = st.error_text, model_path = st.model_path }
+    return ServerState { state = "ready", sha256 = sha, error_text = st.error_text, model_path = st.model_path, cancelled = st.cancelled }
 }
 
 fn failed(ServerState st, string error) → ServerState {
-    return ServerState { state = "failed", sha256 = st.sha256, error_text = error, model_path = st.model_path }
+    return ServerState { state = "failed", sha256 = st.sha256, error_text = error, model_path = st.model_path, cancelled = st.cancelled }
 }
 
 # D5 exit-code decision: 0 clean shutdown, 2 admission/load failure.
 fn exit_code_for(string state) → int {
     if state ≡ "failed" { return 2 }
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# U4 — /generate endpoint
+#
+# The pinned facts and the fixed schema below come from i1-discovery §6.1 /
+# i1-delivery D3/D4. The gradus GeneratioConfigura contract
+# (gradus/src/generation.fab) is the single authority for the generation
+# config surface: unknown fields and out-of-domain values are reject rows
+# (imperium_admissum), enforced by the pinned engine with typed causes —
+# this unit never re-implements them.
+# ---------------------------------------------------------------------------
+
+# The frozen fixture prompt text (i1-discovery §6.1) — the only prompt the
+# encode step can serve until the BD-1 tokenizer encoder lands.
+fn frozen_prompt_text() → string {
+    return "The quick brown fox jumps over the lazy dog"
+}
+
+# The frozen fixture's pinned token ids (P10).
+fn frozen_prompt_ids() → list<int> {
+    return [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+}
+
+# The pinned row's context length (SmolLM2-360M; --context 0 derives this).
+fn model_context_limit() → int {
+    return 8192
+}
+
+# The pinned EOG stop set (D4): <|endoftext|> 0 and <|im_end|> 2. The pinned
+# engine's top-1 surface excludes these ids (faber-runtime cpu_oracle EOG
+# contract), so the engine never ADMITS an EOG token and termination is the
+# max_tokens ceiling; `finish_reason` still carries the "eos" branch for the
+# contract's early-stop rule (fewer tokens than the budget ⇒ the engine
+# stopped at an admitted EOG id).
+fn eog_stop_set() → list<int> {
+    return [0, 2]
+}
+
+# The marker `request_body_text` returns while the valor→octeti extraction
+# gap is open. It is not valid JSON body content (non-ASCII delimiters), so
+# it cannot collide with a real request. (Functions, not top-level fixum —
+# generated consts cannot own String in this toolchain.)
+fn body_read_gap_marker() → string {
+    return "⟪BODY-READ-GAP⟫"
+}
+
+# The parsed /generate request (D3). Presence flags implement D2 precedence:
+# an absent body field inherits the server flag, then the documented default.
+class GenerateRequest {
+    bool ok
+    string error
+    string prompt
+    bool has_prompt
+    bool has_max_tokens
+    int max_tokens
+    bool has_temperature
+    float temperature
+    bool has_top_k
+    int top_k
+    bool has_top_p
+    float top_p
+    bool has_min_p
+    float min_p
+    bool has_repeat_penalty
+    float repeat_penalty
+    bool has_seed
+    int seed
+}
+
+# A fresh empty request (all flags off; `ok` set true — the caller's error
+# path builds its own rejected request).
+fn fresh_generate_request() → GenerateRequest {
+    return GenerateRequest {
+        ok = true, error = "", prompt = "", has_prompt = false,
+        has_max_tokens = false, max_tokens = 0,
+        has_temperature = false, temperature = 0.0,
+        has_top_k = false, top_k = 0,
+        has_top_p = false, top_p = 0.0,
+        has_min_p = false, min_p = 0.0,
+        has_repeat_penalty = false, repeat_penalty = 0.0,
+        has_seed = false, seed = 0
+    }
+}
+
+fn rejected_generate_request(string error) → GenerateRequest {
+    return GenerateRequest {
+        ok = false, error = error, prompt = "", has_prompt = false,
+        has_max_tokens = false, max_tokens = 0,
+        has_temperature = false, temperature = 0.0,
+        has_top_k = false, top_k = 0,
+        has_top_p = false, top_p = 0.0,
+        has_min_p = false, min_p = 0.0,
+        has_repeat_penalty = false, repeat_penalty = 0.0,
+        has_seed = false, seed = 0
+    }
+}
+
+fn generate_request_with_prompt(GenerateRequest r, string v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = v, has_prompt = true,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_max_tokens(GenerateRequest r, int v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = true, max_tokens = v,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_temperature(GenerateRequest r, float v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = true, temperature = v,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_top_k(GenerateRequest r, int v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = true, top_k = v,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_top_p(GenerateRequest r, float v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = true, top_p = v,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_min_p(GenerateRequest r, float v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = true, min_p = v,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_repeat_penalty(GenerateRequest r, float v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = true, repeat_penalty = v,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_seed(GenerateRequest r, int v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = true, seed = v }
+}
+
+# ---------------------------------------------------------------------------
+# Minimal product-owned JSON parser (D3 exception: norma:json is deferred;
+# the second-caller rule triggers the Norma codec delivery). Bounded to the
+# fixed /generate schema: one flat object whose values are strings or
+# numbers. The common string escapes are decoded; \uXXXX is rejected with a
+# typed cause (documented bound). Numbers are bounded (int-form ≤ 18 digits,
+# float-form ≤ 24 chars); out-of-range values fail closed with a typed cause.
+# ---------------------------------------------------------------------------
+
+class JsonCursor {
+    string text
+    int pos
+}
+
+# kind: 1 = string, 2 = integer, 3 = float; 0 = error.
+class JsonScalar {
+    bool ok
+    string error
+    int kind
+    string text
+    int int_value
+    float float_value
+    int pos
+}
+
+fn json_fail(string error, int pos) → JsonScalar {
+    return JsonScalar { ok = false, error = error, kind = 0, text = "", int_value = 0, float_value = 0.0, pos = pos }
+}
+
+# One UTF-8 character at the cursor ("" past the end).
+fn json_char(JsonCursor c) → string {
+    const int len ← c.text.longitudo()
+    if c.pos ≥ len { return "" }
+    return c.text.sectio(c.pos, c.pos + 1)
+}
+
+fn json_skip_ws(JsonCursor c) → JsonCursor {
+    var JsonCursor out ← c
+    var bool go ← true
+    while go {
+        const string ch ← json_char(out)
+        if ch ≡ " " or ch ≡ "\t" or ch ≡ "\n" or ch ≡ "\r" {
+            out ← JsonCursor { text = out.text, pos = out.pos + 1 }
+        } else {
+            go ← false
+        }
+    }
+    return out
+}
+
+fn json_is_digit(string ch) → bool {
+    return (ch ≡ "0") or (ch ≡ "1") or (ch ≡ "2") or (ch ≡ "3") or (ch ≡ "4") or (ch ≡ "5") or (ch ≡ "6") or (ch ≡ "7") or (ch ≡ "8") or (ch ≡ "9")
+}
+
+# Parse a JSON string starting at the opening quote.
+fn json_parse_string(JsonCursor c) → JsonScalar {
+    var JsonCursor cur ← JsonCursor { text = c.text, pos = c.pos + 1 }
+    var string out ← ""
+    var bool done ← false
+    var string err ← ""
+    while (not done) and (err ≡ "") {
+        const string ch ← json_char(cur)
+        if ch ≡ "" {
+            err ← "malformed JSON: unterminated string"
+        } elif ch ≡ "\"" {
+            done ← true
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        } elif ch ≡ "\\" {
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            const string esc ← json_char(cur)
+            if esc ≡ "" {
+                err ← "malformed JSON: unterminated string"
+            } elif esc ≡ "\"" {
+                out ← out + "\""
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "\\" {
+                out ← out + "\\"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "/" {
+                out ← out + "/"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "b" {
+                out ← out + "\b"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "f" {
+                out ← out + "\f"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "n" {
+                out ← out + "\n"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "r" {
+                out ← out + "\r"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "t" {
+                out ← out + "\t"
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } elif esc ≡ "u" {
+                err ← "malformed JSON: \\uXXXX escapes are not supported by the minimal I1 JSON parser"
+            } else {
+                err ← "malformed JSON: unknown escape \\" + esc
+            }
+        } else {
+            out ← out + ch
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        }
+    }
+    return JsonScalar { ok = err ≡ "", error = err, kind = 1, text = out, int_value = 0, float_value = 0.0, pos = cur.pos }
+}
+
+# Parse a JSON number starting at '-' or a digit. Integer-form numbers (no
+# '.', 'e', 'E') parse as int; float-form numbers parse as float.
+fn json_parse_number(JsonCursor c) → JsonScalar {
+    const string body_text ← c.text
+    const int start ← c.pos
+    var JsonCursor cur ← c
+    if json_char(cur) ≡ "-" {
+        cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+    }
+    var bool digits ← false
+    var bool go ← true
+    while go {
+        const string ch ← json_char(cur)
+        if json_is_digit(ch) {
+            digits ← true
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        } else {
+            go ← false
+        }
+    }
+    if not digits {
+        return json_fail("malformed JSON: invalid number", start)
+    }
+    var bool is_float ← false
+    if json_char(cur) ≡ "." {
+        is_float ← true
+        cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        var bool frac ← false
+        go ← true
+        while go {
+            const string ch ← json_char(cur)
+            if json_is_digit(ch) {
+                frac ← true
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } else {
+                go ← false
+            }
+        }
+        if not frac {
+            return json_fail("malformed JSON: invalid fraction", cur.pos)
+        }
+    }
+    const string e_ch ← json_char(cur)
+    if e_ch ≡ "e" or e_ch ≡ "E" {
+        is_float ← true
+        cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        const string sign ← json_char(cur)
+        if sign ≡ "+" or sign ≡ "-" {
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        }
+        var bool exp ← false
+        go ← true
+        while go {
+            const string ch ← json_char(cur)
+            if json_is_digit(ch) {
+                exp ← true
+                cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            } else {
+                go ← false
+            }
+        }
+        if not exp {
+            return json_fail("malformed JSON: invalid exponent", cur.pos)
+        }
+    }
+    const int token_len ← cur.pos - start
+    if (not is_float) and (token_len > 18) {
+        return json_fail("malformed JSON: integer out of range", cur.pos)
+    }
+    if is_float and (token_len > 24) {
+        return json_fail("malformed JSON: number too long", cur.pos)
+    }
+    const string token ← body_text.sectio(start, cur.pos)
+    if is_float {
+        const float fv ← token ↦ float ⇥ 0.0
+        return JsonScalar { ok = true, error = "", kind = 3, text = token, int_value = 0, float_value = fv, pos = cur.pos }
+    }
+    const int iv ← token ↦ int ⇥ 0
+    return JsonScalar { ok = true, error = "", kind = 2, text = token, int_value = iv, float_value = 0.0, pos = cur.pos }
+}
+
+# Parse a /generate request body (D3) into the fixed schema. Unknown fields,
+# duplicate fields, wrong types, and malformed JSON reject with typed causes.
+fn json_parse_generate_body(string body) → GenerateRequest {
+    const string body_text ← body
+    const JsonCursor start ← JsonCursor { text = body_text, pos = 0 }
+    var JsonCursor cur ← json_skip_ws(start)
+    if json_char(cur) ≠ "{" {
+        return rejected_generate_request("malformed JSON: expected an object")
+    }
+    cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+
+    var GenerateRequest out ← fresh_generate_request()
+    var bool go ← true
+    var bool after_comma ← false
+    while go {
+        cur ← json_skip_ws(cur)
+        const string key_start ← json_char(cur)
+        if key_start ≡ "}" {
+            # A `}` directly after `{` is the empty object; a `}` after a
+            # comma is a trailing-comma reject (fail closed).
+            if after_comma {
+                return rejected_generate_request("malformed JSON: trailing comma")
+            }
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            go ← false
+            break
+        }
+        if key_start ≠ "\"" {
+            return rejected_generate_request("malformed JSON: expected a field name")
+        }
+        const JsonScalar key ← json_parse_string(cur)
+        if not key.ok {
+            return rejected_generate_request(key.error)
+        }
+        const string fname ← key.text
+        cur ← json_skip_ws(JsonCursor { text = cur.text, pos = key.pos })
+        if json_char(cur) ≠ ":" {
+            return rejected_generate_request("malformed JSON: expected ':' after field '" + fname + "'")
+        }
+        cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+        cur ← json_skip_ws(cur)
+
+        const string vch ← json_char(cur)
+        var JsonScalar val ← json_fail("malformed JSON: unexpected value", cur.pos)
+        if vch ≡ "\"" {
+            val ← json_parse_string(cur)
+        } elif vch ≡ "-" or json_is_digit(vch) {
+            val ← json_parse_number(cur)
+        } else {
+            return rejected_generate_request("field '" + fname + "': value must be a JSON string or number (minimal I1 parser)")
+        }
+        if not val.ok {
+            return rejected_generate_request(val.error)
+        }
+        cur ← json_skip_ws(JsonCursor { text = cur.text, pos = val.pos })
+
+        # Dispatch the fixed /generate schema. Unknown fields are reject rows
+        # mirroring the gradus imperium_admissum vocabulary (never silently
+        # ignored); duplicates fail closed too.
+        if fname ≡ "prompt" {
+            if out.has_prompt {
+                return rejected_generate_request("duplicate field 'prompt'")
+            }
+            if val.kind ≠ 1 {
+                return rejected_generate_request("field 'prompt' must be a JSON string")
+            }
+            if val.text ≡ "" {
+                return rejected_generate_request("field 'prompt' must not be empty")
+            }
+            out ← generate_request_with_prompt(out, val.text)
+        } elif fname ≡ "max_tokens" {
+            if out.has_max_tokens {
+                return rejected_generate_request("duplicate field 'max_tokens'")
+            }
+            if val.kind ≠ 2 {
+                return rejected_generate_request("field 'max_tokens' must be an integer")
+            }
+            out ← generate_request_with_max_tokens(out, val.int_value)
+        } elif fname ≡ "temperature" {
+            if out.has_temperature {
+                return rejected_generate_request("duplicate field 'temperature'")
+            }
+            if (val.kind ≠ 2) and (val.kind ≠ 3) {
+                return rejected_generate_request("field 'temperature' must be a JSON number")
+            }
+            const float tv ← if_float(val.kind ≡ 2, (val.int_value ↦ float), val.float_value)
+            out ← generate_request_with_temperature(out, tv)
+        } elif fname ≡ "top_k" {
+            if out.has_top_k {
+                return rejected_generate_request("duplicate field 'top_k'")
+            }
+            if val.kind ≠ 2 {
+                return rejected_generate_request("field 'top_k' must be an integer")
+            }
+            out ← generate_request_with_top_k(out, val.int_value)
+        } elif fname ≡ "top_p" {
+            if out.has_top_p {
+                return rejected_generate_request("duplicate field 'top_p'")
+            }
+            if (val.kind ≠ 2) and (val.kind ≠ 3) {
+                return rejected_generate_request("field 'top_p' must be a JSON number")
+            }
+            const float pv ← if_float(val.kind ≡ 2, (val.int_value ↦ float), val.float_value)
+            out ← generate_request_with_top_p(out, pv)
+        } elif fname ≡ "min_p" {
+            if out.has_min_p {
+                return rejected_generate_request("duplicate field 'min_p'")
+            }
+            if (val.kind ≠ 2) and (val.kind ≠ 3) {
+                return rejected_generate_request("field 'min_p' must be a JSON number")
+            }
+            const float mv ← if_float(val.kind ≡ 2, (val.int_value ↦ float), val.float_value)
+            out ← generate_request_with_min_p(out, mv)
+        } elif fname ≡ "repeat_penalty" {
+            if out.has_repeat_penalty {
+                return rejected_generate_request("duplicate field 'repeat_penalty'")
+            }
+            if (val.kind ≠ 2) and (val.kind ≠ 3) {
+                return rejected_generate_request("field 'repeat_penalty' must be a JSON number")
+            }
+            const float rv ← if_float(val.kind ≡ 2, (val.int_value ↦ float), val.float_value)
+            out ← generate_request_with_repeat_penalty(out, rv)
+        } elif fname ≡ "seed" {
+            if out.has_seed {
+                return rejected_generate_request("duplicate field 'seed'")
+            }
+            if val.kind ≠ 2 {
+                return rejected_generate_request("field 'seed' must be an integer")
+            }
+            out ← generate_request_with_seed(out, val.int_value)
+        } else {
+            return rejected_generate_request("unknown field '" + fname + "' (imperium_admissum reject — never silently ignored)")
+        }
+
+        cur ← json_skip_ws(cur)
+        const string sep ← json_char(cur)
+        if sep ≡ "," {
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            after_comma ← true
+        } elif sep ≡ "}" {
+            cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
+            after_comma ← false
+            go ← false
+        } else {
+            return rejected_generate_request("malformed JSON: expected ',' or '}'")
+        }
+    }
+
+    # No trailing content allowed.
+    const JsonCursor end ← json_skip_ws(cur)
+    if end.pos < body_text.longitudo() {
+        return rejected_generate_request("malformed JSON: trailing content after object")
+    }
+    if not out.has_prompt {
+        return rejected_generate_request("missing required field 'prompt'")
+    }
+    return out
+}
+
+# Value-preserving picks (the toolchain has no inline if-expression).
+fn if_int(bool cond, int a, int b) → int {
+    if cond { return a }
+    return b
+}
+
+fn if_float(bool cond, float a, float b) → float {
+    if cond { return a }
+    return b
+}
+
+# ---------------------------------------------------------------------------
+# Generation config (the nine gradus GeneratioConfigura fields, D2/D4)
+# ---------------------------------------------------------------------------
+
+class GenerateConfig {
+    int contextus
+    int magna_promptus
+    int maxima_verborum
+    int semen
+    float temperatura
+    int top_k
+    float top_p
+    float min_p
+    float poena_repetitionis
+}
+
+# D2 precedence: body fields override server flags, flags override defaults.
+# `magna_promptus` is the prefill batch — pinned to 1 (one request at a time
+# in I1); the delivery doc's prose maps it to the prompt text, but the gradus
+# contract and the engine treat it as the batch size (observed behavior wins).
+fn build_generate_config(GenerateRequest req, ServeConfig server) → GenerateConfig {
+    const int contextus ← if_int(server.context ≡ 0, model_context_limit(), server.context)
+    const int maxima ← if_int(req.has_max_tokens, req.max_tokens, server.max_tokens)
+    const int seed ← if_int(req.has_seed, req.seed, server.seed)
+    const float temperatura ← if_float(req.has_temperature, req.temperature, 0.0)
+    const int top_k ← if_int(req.has_top_k, req.top_k, 0)
+    const float top_p ← if_float(req.has_top_p, req.top_p, 1.0)
+    const float min_p ← if_float(req.has_min_p, req.min_p, 0.0)
+    const float poena ← if_float(req.has_repeat_penalty, req.repeat_penalty, 1.0)
+    return GenerateConfig {
+        contextus = contextus,
+        magna_promptus = 1,
+        maxima_verborum = maxima,
+        semen = seed,
+        temperatura = temperatura,
+        top_k = top_k,
+        top_p = top_p,
+        min_p = min_p,
+        poena_repetitionis = poena
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Prompt encode (the "encode" phase of the generation pipeline)
+# ---------------------------------------------------------------------------
+
+class EncodeResult {
+    bool ok
+    string error
+    list<int> ids
+}
+
+# Text → token ids (the "encode" phase). model.tokenize is the real encoder
+# once BD-1 lands; today it rejects and the pinned fallback serves the frozen
+# fixture. One verified prompt row, never silent generalization (fail closed).
+#
+# The fallback conditional lives in a separate function: the MIR stepper
+# (`faber test`) cannot lower a conditional inside a `cape` block that wraps a
+# library-provider call (recorded toolchain limitation, cf. BD-3).
+fn encode_fallback(string prompt, string bind_error) → EncodeResult {
+    if prompt ≡ frozen_prompt_text() {
+        return EncodeResult { ok = true, error = "", ids = frozen_prompt_ids() }
+    }
+    return EncodeResult { ok = false, error = "prompt encode unavailable: " + bind_error, ids = [] }
+}
+
+fn encode_prompt(string prompt) → EncodeResult {
+    fac {
+        const list<int> ids ← model.tokenize(prompt)
+        return EncodeResult { ok = true, error = "", ids = ids }
+    }
+    cape err {
+        return encode_fallback(prompt, err ↦ string)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Response assembly (D3) + error classification
+# ---------------------------------------------------------------------------
+
+# The generated ids joined with spaces — a documented placeholder: no
+# detokenizer exists yet (BD-1), so `text` cannot be the decoded surface; the
+# ids in `tokens` are authoritative.
+fn tokens_text(list<int> tokens) → string {
+    var string out ← ""
+    var int i ← 0
+    while i < tokens.longitudo() {
+        if i > 0 { out ← out + " " }
+        const int t ← tokens.accipe(i) coalesce 0
+        out ← out + (t ↦ string)
+        i ← i + 1
+    }
+    return out
+}
+
+fn tokens_json(list<int> tokens) → string {
+    var string out ← "["
+    var int i ← 0
+    while i < tokens.longitudo() {
+        if i > 0 { out ← out + "," }
+        const int t ← tokens.accipe(i) coalesce 0
+        out ← out + (t ↦ string)
+        i ← i + 1
+    }
+    return out + "]"
+}
+
+# D3 finish_reason: "length" at max_tokens; "eos" when the engine stopped
+# early at an admitted EOG id {0,2} (the pinned engine excludes EOG ids from
+# the top-1 surface, so with the frozen row the ceiling always binds).
+fn finish_reason(int generated, int max_tokens) → string {
+    if generated ≥ max_tokens { return "length" }
+    return "eos"
+}
+
+# The /generate response body. `model` carries the minimal identity facts
+# held by this server (sha256 + path); the full /model identity surface is
+# U3 (not yet landed).
+fn generate_response_body(ServerState st, list<int> tokens, list<int> prompt_ids, int max_tokens) → string {
+    const int pn ← prompt_ids.longitudo()
+    const int cn ← tokens.longitudo()
+    const int total ← pn + cn
+    const string reason ← finish_reason(cn, max_tokens)
+    return "{\"model\":{\"sha256\":\"" + st.sha256 + "\",\"path\":\"" + st.model_path + "\"},\"text\":\"" + tokens_text(tokens) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
+}
+
+# JSON-string escape for error bodies (the engine's typed causes carry
+# quotes, e.g. unknown config field "bogus"). Backslashes first, then
+# quotes — the reverse order would double the inserted backslashes.
+fn json_escape(string s) → string {
+    return s.muta("\\", "\\\\").muta("\"", "\\\"")
+}
+
+fn error_body(string error) → string {
+    return "{\"error\":\"" + json_escape(error) + "\"}"
+}
+
+# D3: 503 before ready carries the state.
+fn state_body(ServerState st) → string {
+    return "{\"state\":\"" + st.state + "\",\"error\":\"" + json_escape(st.error_text) + "\"}"
+}
+
+# model:generate error → HTTP status. The request-side causes are the gradus
+# reject rows (typed ConfiguraInvalida/Terminus causes surfaced by the engine
+# — "config" domains, the greedy-only rule, prompt fit, the context cursor);
+# engine-side failures (prefill/forward/decode, oracle build) are 500.
+fn classify_generate_error(string err) → int {
+    if err.initium("model:generate config") or err.initium("model:generate unknown") or err.initium("model:generate implements") or err.initium("model:generate needs at least one prompt token") or err.initium("model:generate prompt length") or err.initium("model:generate context limit") {
+        return 400
+    }
+    return 500
+}
+
+# Request-body extraction seam (U4). The http provider delivers the body as
+# valor octeti; the snapshot toolchain has no valor→octeti extraction
+# (`value ↦ bytes` fails codegen; `value ↦ string` fails at runtime on octeti
+# payloads — recorded toolchain gap, routed to radix/faber-runtime). Until it
+# lands, the marker is returned and the handler answers 500 with the typed
+# gap. The function signature needs no change when the gap closes.
+fn request_body_text(value body_value) → string {
+    return body_value ↦ string ⇥ body_read_gap_marker()
 }
 
 # ---------------------------------------------------------------------------
@@ -258,9 +975,73 @@ fn health_body(ServerState st) → string {
     return "{\"state\":\"ready\",\"model\":{\"sha256\":\"" + st.sha256 + "\",\"path\":\"" + st.model_path + "\"}}"
 }
 
+# Handle a /generate request (U4). The pipeline: method gate → state gate →
+# cancellation checkpoint → body read → minimal JSON parse → cancellation
+# checkpoint → encode → engine generate (prefill + greedy decode with the
+# pinned EOG stop set and the max_tokens budget) → response assembly.
+# Domain validation (the gradus reject rows) is enforced by the engine with
+# typed causes; this unit maps them to 400/500.
+fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
+    # Method gate: /generate is POST (D3).
+    const value vm ← tab.accipe("method")
+    const string method ← vm ↦ string
+    if method ≠ "POST" {
+        http_respond(id, 400, error_body("method must be POST for /generate"))
+        return
+    }
+    # State gate: 503 before ready (D3).
+    if st.state ≠ "ready" {
+        http_respond(id, 503, state_body(st))
+        return
+    }
+    # Cancellation checkpoint (D6 seam; no signal source is wired yet — the
+    # native host has no processus signal route, a recorded U6 gap).
+    if st.cancelled {
+        http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+        return
+    }
+    # Body read (the toolchain seam — see request_body_text).
+    const value bv ← tab.accipe("body")
+    const string body ← request_body_text(bv)
+    if body ≡ body_read_gap_marker() {
+        http_respond(id, 500, error_body("request body unavailable: the valor→octeti extraction is a recorded toolchain gap (routed to radix/faber-runtime); no /generate request can be read until it lands"))
+        return
+    }
+    # Minimal product JSON parse (D3).
+    const GenerateRequest parsed ← json_parse_generate_body(body)
+    if not parsed.ok {
+        http_respond(id, 400, error_body(parsed.error))
+        return
+    }
+    if st.cancelled {
+        http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+        return
+    }
+    # Encode: text → token ids (BD-1 absent → pinned frozen-fixture row).
+    const EncodeResult enc ← encode_prompt(parsed.prompt)
+    if not enc.ok {
+        http_respond(id, 400, error_body(enc.error))
+        return
+    }
+    const GenerateConfig cfg ← build_generate_config(parsed, config)
+    fac {
+        const list<int> tokens ← model.generate(cfg ↦ value, enc.ids)
+        # Cancellation checkpoint after decode (D6 seam).
+        if st.cancelled {
+            http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+        } else {
+            http_respond(id, 200, generate_response_body(st, tokens, enc.ids, cfg.maxima_verborum))
+        }
+    }
+    cape err {
+        const int code ← classify_generate_error(err)
+        http_respond(id, code, error_body(err))
+    }
+}
+
 # Respond to one request carrier. /health is always 200 once the listener is
-# up; any other path is 404 (D3).
-fn handle_request(value request, ServerState st) → void {
+# up; /generate is the U4 endpoint; any other path is 404 (D3).
+fn handle_request(value request, ServerState st, ServeConfig config) → void {
     if request is map<string, value> {
         const map<string, value> tab ← request ↦ map<string, value>
         const value vid ← tab.accipe("id")
@@ -269,10 +1050,25 @@ fn handle_request(value request, ServerState st) → void {
         const string path ← via ↦ string
         if path ≡ "/health" {
             http_respond(id, 200, health_body(st))
+        } elif path ≡ "/generate" {
+            handle_generate(tab, st, config, id)
         } else {
             http_respond(id, 404, "not found")
         }
     }
+}
+
+# Accept-loop step: keep serving unless the listener was stopped or the
+# accept was cancelled; log other request-level rejects (oversize body,
+# malformed request) and continue. A stopped listener ends the loop (D6).
+fn accept_loop_step(bool serving, string err) → bool {
+    const bool cancelled_hit ← err.continet("E_CANCELLED")
+    const bool stopped_hit ← err.continet("listener is stopped")
+    if cancelled_hit or stopped_hit {
+        return false
+    }
+    stderr_write("inferentia: request dropped at accept: " + err + "\n")
+    return serving
 }
 
 fn serve(ServeConfig config) → void {
@@ -293,15 +1089,52 @@ fn serve(ServeConfig config) → void {
         stderr_write("inferentia: admission failed: " + err + "\n")
     }
 
+    # U4 generation readiness: load the weights exactly once (the binding's
+    # oracle is a process-wide OnceLock — the resident-model semantics) and
+    # prove the engine can decode before serving. The single load is recorded
+    # on stderr; every /generate reuses the resident model (no reload). A
+    # failed warm-up is an admission/load failure (D5 → exit 2 at shutdown).
+    if state.state ≡ "ready" {
+        fac {
+            const value warmup_cfg ← GenerateConfig {
+                contextus = model_context_limit(),
+                magna_promptus = 1,
+                maxima_verborum = 1,
+                semen = config.seed,
+                temperatura = 0.0,
+                top_k = 0,
+                top_p = 1.0,
+                min_p = 0.0,
+                poena_repetitionis = 1.0
+            } ↦ value
+            const list<int> warmup_tokens ← model.generate(warmup_cfg, frozen_prompt_ids())
+            const int n ← warmup_tokens.longitudo()
+            if n < 1 {
+                state ← failed(state, "generation readiness: warm-up produced no tokens")
+                stderr_write("inferentia: generation readiness failed: warm-up produced no tokens\n")
+            } else {
+                stderr_write("inferentia: model loaded once (resident) — generation ready\n")
+            }
+        }
+        cape err {
+            state ← failed(state, "generation readiness failed: " + err)
+            stderr_write("inferentia: generation readiness failed: " + err + "\n")
+        }
+    }
+
     var bool serving ← true
     while serving {
         fac {
             const value request ← http_accept(listener)
-            handle_request(request, state)
+            handle_request(request, state, config)
         }
         cape err {
-            # Listener stopped or accept failed — end the serve loop.
-            serving ← false
+            # A request-level reject (oversize body, malformed request) must
+            # not end the serve loop; only a stopped/cancelled listener does.
+            # The decision lives in a helper: the MIR stepper (`faber test`)
+            # cannot lower a conditional inside a `cape` block that wraps a
+            # local call into a host route (recorded toolchain limitation).
+            serving ← accept_loop_step(serving, err ↦ string)
         }
     }
 
@@ -395,5 +1228,183 @@ describe "health lifecycle" tag "inferentia" {
         assert exit_code_for("failed") ≡ 2
         assert exit_code_for("ready") ≡ 0
         assert exit_code_for("starting") ≡ 0
+    }
+}
+describe "generate request JSON parse" tag "inferentia" {
+    test "frozen fixture request parses to the pinned fields" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"The quick brown fox jumps over the lazy dog\",\"max_tokens\":16,\"temperature\":0.0,\"top_k\":0,\"top_p\":1.0,\"min_p\":0.0,\"repeat_penalty\":1.0,\"seed\":1}")
+        assert req.ok
+        assert req.prompt ≡ "The quick brown fox jumps over the lazy dog"
+        assert req.has_prompt
+        assert req.has_max_tokens
+        assert req.max_tokens ≡ 16
+        assert req.has_temperature
+        assert req.temperature ≡ 0.0
+        assert (req.has_top_k) and (req.top_k ≡ 0)
+        assert (req.has_top_p) and (req.top_p ≡ 1.0)
+        assert (req.has_min_p) and (req.min_p ≡ 0.0)
+        assert (req.has_repeat_penalty) and (req.repeat_penalty ≡ 1.0)
+        assert (req.has_seed) and (req.seed ≡ 1)
+    }
+    test "minimal request parses with optional fields absent" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"The quick brown fox jumps over the lazy dog\"}")
+        assert req.ok
+        assert req.prompt ≡ "The quick brown fox jumps over the lazy dog"
+        assert not req.has_max_tokens
+        assert not req.has_temperature
+        assert not req.has_seed
+    }
+    test "unknown field is an imperium_admissum reject row" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"hi\",\"bogus\":1}")
+        assert not req.ok
+        assert req.error.continet("unknown field 'bogus'")
+        assert req.error.continet("imperium_admissum")
+    }
+    test "empty prompt is rejected" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"\"}")
+        assert not req.ok
+        assert req.error.continet("must not be empty")
+    }
+    test "missing prompt is rejected" {
+        const GenerateRequest req ← json_parse_generate_body("{\"max_tokens\":4}")
+        assert not req.ok
+        assert req.error.continet("missing required field 'prompt'")
+    }
+    test "malformed JSON is rejected with a typed cause" {
+        assert not (json_parse_generate_body("")).ok
+        assert not (json_parse_generate_body("not json")).ok
+        assert not (json_parse_generate_body("{\"prompt\":")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\"} trailing")).ok
+        assert not (json_parse_generate_body("{\"prompt\" \"hi\"}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",}")).ok
+    }
+    test "wrong field types are rejected" {
+        assert not (json_parse_generate_body("{\"prompt\":42}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_tokens\":16.5}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_tokens\":\"x\"}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"seed\":true}")).ok
+    }
+    test "duplicate fields are rejected" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\",\"prompt\":\"b\"}")
+        assert not req.ok
+        assert req.error.continet("duplicate field")
+    }
+    test "whitespace and integer-form floats are tolerated" {
+        const GenerateRequest req ← json_parse_generate_body("  { \"prompt\" : \"hi\" , \"max_tokens\" : 4 , \"temperature\" : 1 }  ")
+        assert req.ok
+        assert req.prompt ≡ "hi"
+        assert req.max_tokens ≡ 4
+        assert (req.has_temperature) and (req.temperature ≡ 1.0)
+    }
+    test "escapes decode in string values" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\\nb\\tc\\\"d\"}")
+        assert req.ok
+        assert req.prompt ≡ "a\nb\tc\"d"
+    }
+    test "unsupported unicode escape is rejected with a typed cause" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\\u0041\"}")
+        assert not req.ok
+        assert req.error.continet("\\uXXXX escapes are not supported")
+    }
+}
+describe "generate config precedence" tag "inferentia" {
+    test "body overrides server flag overrides default" {
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, context = 0, seed = 1, log_level = "info" }
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_tokens\":8,\"seed\":3}")
+        const GenerateConfig cfg ← build_generate_config(req, server)
+        assert cfg.contextus ≡ 8192
+        assert cfg.maxima_verborum ≡ 8
+        assert cfg.semen ≡ 3
+        assert cfg.magna_promptus ≡ 1
+        assert cfg.temperatura ≡ 0.0
+        assert cfg.top_k ≡ 0
+        assert cfg.top_p ≡ 1.0
+        assert cfg.min_p ≡ 0.0
+        assert cfg.poena_repetitionis ≡ 1.0
+    }
+    test "absent body fields inherit the server flags" {
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, context = 4096, seed = 7, log_level = "info" }
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\"}")
+        const GenerateConfig cfg ← build_generate_config(req, server)
+        assert cfg.contextus ≡ 4096
+        assert cfg.maxima_verborum ≡ 16
+        assert cfg.semen ≡ 7
+        assert cfg.temperatura ≡ 0.0
+        assert cfg.top_p ≡ 1.0
+        assert cfg.poena_repetitionis ≡ 1.0
+    }
+}
+describe "prompt encode" tag "inferentia" {
+    test "frozen fixture text maps to the pinned prompt ids (BD-1 absent placeholder)" {
+        # Tests the pure fallback directly: the wrapper (encode_prompt) calls
+        # the model.tokenize library route, which the MIR stepper (`faber test`)
+        # cannot execute (recorded toolchain limitation, cf. BD-3).
+        const EncodeResult enc ← encode_fallback(frozen_prompt_text(), "model:tokenize requires the BD-1 tokenizer encoder")
+        assert enc.ok
+        const int n ← enc.ids.longitudo()
+        assert n ≡ 9
+        const int first ← enc.ids.accipe(0) coalesce 0
+        assert first ≡ 504
+    }
+    test "any other prompt rejects with the typed cause" {
+        const EncodeResult enc ← encode_fallback("some other text", "model:tokenize requires the BD-1 tokenizer encoder (gradus BBPE text→ids), which is not implemented yet")
+        assert not enc.ok
+        assert enc.error.continet("prompt encode unavailable")
+        assert enc.error.continet("BD-1")
+    }
+}
+describe "generate error classification" tag "inferentia" {
+    test "gradus reject-row causes map to 400" {
+        assert classify_generate_error("model:generate config maxima_verborum must fit within contextus") ≡ 400
+        assert classify_generate_error("model:generate unknown config field \"bogus\" (imperium_admissum reject)") ≡ 400
+        assert classify_generate_error("model:generate implements only the deterministic greedy path") ≡ 400
+        assert classify_generate_error("model:generate prompt length 9000 does not fit contextus 8192") ≡ 400
+        assert classify_generate_error("model:generate context limit reached") ≡ 400
+        assert classify_generate_error("model:generate config semen must be at least one") ≡ 400
+    }
+    test "engine-side failures map to 500" {
+        assert classify_generate_error("model:generate prefill failed: op mismatch") ≡ 500
+        assert classify_generate_error("model:generate decode failed: layout") ≡ 500
+        assert classify_generate_error("model bridge: pinned model unavailable") ≡ 500
+        assert classify_generate_error("") ≡ 500
+    }
+}
+
+describe "generate response" tag "inferentia" {
+    test "finish reason is length at the budget and eos below it" {
+        assert finish_reason(16, 16) ≡ "length"
+        assert finish_reason(5, 16) ≡ "eos"
+        assert finish_reason(0, 1) ≡ "eos"
+    }
+    test "tokens text and json formats" {
+        const list<int> tokens ← [30, 198, 198]
+        assert tokens_text(tokens) ≡ "30 198 198"
+        assert tokens_json(tokens) ≡ "[30,198,198]"
+        const list<int> empty ← []
+        assert tokens_text(empty) ≡ ""
+        assert tokens_json(empty) ≡ "[]"
+    }
+    test "generate response body shape" {
+        const ServerState st ← admitted(new_state("/models/x.gguf"), "2fa3f013")
+        const list<int> tokens ← [30, 198, 198]
+        const list<int> prompt_ids ← [504, 2365]
+        const string body ← generate_response_body(st, tokens, prompt_ids, 16)
+        assert body.continet("\"model\"")
+        assert body.continet("\"text\":\"30 198 198\"")
+        assert body.continet("\"tokens\":[30,198,198]")
+        assert body.continet("\"finish_reason\":\"eos\"")
+        assert body.continet("\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}")
+    }
+    test "error body escapes embedded quotes" {
+        const string body ← error_body("model:generate unknown config field \"bogus\"")
+        assert body ≡ "{\"error\":\"model:generate unknown config field \\\"bogus\\\"\"}"
+    }
+    test "eog stop set is pinned to {0,2}" {
+        const list<int> eog ← eog_stop_set()
+        const int n ← eog.longitudo()
+        assert n ≡ 2
+        const int first ← eog.accipe(0) coalesce -1
+        const int second ← eog.accipe(1) coalesce -1
+        assert (first ≡ 0) and (second ≡ 2)
     }
 }
