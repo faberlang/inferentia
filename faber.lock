@@ -1,0 +1,13 @@
+[[package]]
+name = "model"
+version = "0.1.0"
+source = "path"
+package_root = "../faber-runtime/model"
+kind = "lib"
+target_language = "rust"
+target_triple = "host"
+target_manifest = ""
+interface_root = "../faber-runtime/model/src"
+artifact = ""
+crate = "model"
+rustc = ""

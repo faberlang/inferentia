@@ -1,10 +1,18 @@
 # =============================================================================
-# Inferentia — local GGUF inference server (I1 U1)
+# Inferentia — local GGUF inference server (I1 U1 + U2)
 # =============================================================================
 #
 # U1 scope: `serve` CLI parsing (D1), configuration precedence (D2), and host
 # bootstrap — bind a loopback listener, answer `/health`, and exit on usage
 # errors before any listener binds.
+#
+# U2 scope: admission at startup + health lifecycle — the listener binds
+# first, `admit` runs before any allocation, and `/health` serves
+# `starting` → `ready` (with model identity) or `failed` (with the typed
+# cause). No weight materialization happens on this path: only `model:admit`
+# (digest verification first, then structure validation — the BD-2 execution
+# bridge over the faber-runtime pinned-row engine) is called; `forward` /
+# `generate` are never invoked here.
 #
 # The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
 # no streaming. The `norma:http` server wrappers are not yet wired into the
@@ -19,7 +27,7 @@
 #
 # Documented constants are the defaults; server flags override them. `context`
 # uses 0 as the "derive from the model's context_length" sentinel (the model is
-# admitted in U2+); an explicit `--context 0` is rejected as a config error.
+# admitted at startup); an explicit `--context 0` is rejected as a config error.
 # ---------------------------------------------------------------------------
 class ServeConfig {
     string model
@@ -32,7 +40,44 @@ class ServeConfig {
 }
 
 # ---------------------------------------------------------------------------
-# Host provider routes (physical effects live behind the hosts kernel)
+# Admission lifecycle state (D3 health states: starting | ready | failed)
+# ---------------------------------------------------------------------------
+
+# The pinned-row engine's admission route (BD-2 execution bridge).
+import from "model:model" private model
+
+class ServerState {
+    string state
+    string sha256
+    string error_text
+    string model_path
+}
+
+# A fresh state is `starting` until admission runs (bind → admit → allocate).
+fn new_state(string model_path) → ServerState {
+    return ServerState { state = "starting", sha256 = "", error_text = "", model_path = model_path }
+}
+
+# Functional transitions — Faber class parameters have value semantics, so a
+# transition returns a new state instead of mutating in place.
+fn admitted(ServerState st, string sha) → ServerState {
+    return ServerState { state = "ready", sha256 = sha, error_text = st.error_text, model_path = st.model_path }
+}
+
+fn failed(ServerState st, string error) → ServerState {
+    return ServerState { state = "failed", sha256 = st.sha256, error_text = error, model_path = st.model_path }
+}
+
+# D5 exit-code decision: 0 clean shutdown, 2 admission/load failure.
+fn exit_code_for(string state) → int {
+    if state ≡ "failed" { return 2 }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Host provider routes (physical effects live behind the hosts kernel).
+# Call forms match the provider manifests' declared opener contracts (bare
+# values for textus/numerus openers, lists for lista<valor> openers).
 # ---------------------------------------------------------------------------
 
 # Bind a loopback HTTP/1.1 listener and return its opaque handle.
@@ -195,13 +240,27 @@ fn parse_cli(list<string> argv) → ServeConfig {
 }
 
 # ---------------------------------------------------------------------------
-# Server loop (U1 proves the listener + CLI surface; the /health lifecycle and
-# request handling beyond path routing belong to U2+).
+# Server loop + health lifecycle (U1 listener, U2 admission + states)
 # ---------------------------------------------------------------------------
+
+# The /health body per D3. The model identity on ready carries the verified
+# whole-file SHA-256 (the only identity fact the BD-2 admit route returns) and
+# the configured path; on failed it carries the typed cause.
+# Note: the D3 `pid` field is not served — the toolchain has no process-
+# identity call form (empty-opener routes fail codegen; recorded gap).
+fn health_body(ServerState st) → string {
+    if st.state ≡ "starting" {
+        return "{\"state\":\"starting\",\"model\":null}"
+    }
+    if st.state ≡ "failed" {
+        return "{\"state\":\"failed\",\"model\":{\"error\":\"" + st.error_text + "\"}}"
+    }
+    return "{\"state\":\"ready\",\"model\":{\"sha256\":\"" + st.sha256 + "\",\"path\":\"" + st.model_path + "\"}}"
+}
 
 # Respond to one request carrier. /health is always 200 once the listener is
 # up; any other path is 404 (D3).
-fn handle_request(value request) → void {
+fn handle_request(value request, ServerState st) → void {
     if request is map<string, value> {
         const map<string, value> tab ← request ↦ map<string, value>
         const value vid ← tab.accipe("id")
@@ -209,7 +268,7 @@ fn handle_request(value request) → void {
         const value via ← tab.accipe("path")
         const string path ← via ↦ string
         if path ≡ "/health" {
-            http_respond(id, 200, "{\"state\":\"starting\"}")
+            http_respond(id, 200, health_body(st))
         } else {
             http_respond(id, 404, "not found")
         }
@@ -217,12 +276,42 @@ fn handle_request(value request) → void {
 }
 
 fn serve(ServeConfig config) → void {
+    # U2 admission ordering: bind first, then admit BEFORE any allocation.
+    # Weight materialization is out of this path: admit only verifies the
+    # digest and the pinned-row structure (BD-2 gate), never forward/generate.
     const int listener ← http_listen(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
-    while true {
-        const value request ← http_accept(listener)
-        handle_request(request)
+
+    var ServerState state ← new_state(config.model)
+    fac {
+        const string sha ← model.admit(state.model_path)
+        state ← admitted(state, sha)
+        stderr_write("inferentia: model admitted (sha256 " + sha + ")\n")
     }
+    cape err {
+        state ← failed(state, err)
+        stderr_write("inferentia: admission failed: " + err + "\n")
+    }
+
+    var bool serving ← true
+    while serving {
+        fac {
+            const value request ← http_accept(listener)
+            handle_request(request, state)
+        }
+        cape err {
+            # Listener stopped or accept failed — end the serve loop.
+            serving ← false
+        }
+    }
+
+    # Loop-end shutdown path (reachable when accept fails). The D5 exit-code
+    # decision maps failed admission to exit 2; the delivery seam is a
+    # recorded toolchain gap (processus:exi is unmanifested for the native
+    # host, and no signal handling is wired) — the executable exit-code proof
+    # runs in the admission-gate harness under tests/admission-gate/.
+    stderr_write("inferentia: shutting down (exit code " + (exit_code_for(state.state) ↦ string) + ")\n")
+    panic "inferentia: serve loop ended; intended exit code " + (exit_code_for(state.state) ↦ string)
 }
 
 # ---------------------------------------------------------------------------
@@ -234,7 +323,9 @@ main args argv {
 }
 
 # ---------------------------------------------------------------------------
-# Tests (pure parse-path coverage; error exits are proven by the binary)
+# Tests (pure parse + lifecycle logic; error exits are proven by the binary;
+# the provider-touching admission path is executed by the admission-gate
+# harness under tests/admission-gate/ and proven by the in-tree BD-2 probe)
 # ---------------------------------------------------------------------------
 describe "serve cli parse" tag "inferentia" {
     test "documented constants apply when no server flags are given" {
@@ -267,5 +358,42 @@ describe "serve cli parse" tag "inferentia" {
         assert cfg.context ≡ 0
         const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--context", "4096"])
         assert cfg2.context ≡ 4096
+    }
+}
+describe "health lifecycle" tag "inferentia" {
+    test "state starts starting before admission" {
+        const ServerState st ← new_state("/models/x.gguf")
+        assert st.state ≡ "starting"
+        assert st.sha256 ≡ ""
+        assert st.error_text ≡ ""
+    }
+    test "admission success transitions to ready with model identity" {
+        const ServerState st ← admitted(new_state("/models/x.gguf"), "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert st.state ≡ "ready"
+        assert st.sha256 ≡ "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+        assert st.error_text ≡ ""
+        assert st.model_path ≡ "/models/x.gguf"
+    }
+    test "admission failure transitions to failed with typed error" {
+        const ServerState st ← failed(new_state("/missing.gguf"), "model:admit failed: io error: No such file")
+        assert st.state ≡ "failed"
+        assert st.error_text ≡ "model:admit failed: io error: No such file"
+    }
+    test "health body starting" {
+        const ServerState st ← new_state("/models/x.gguf")
+        assert health_body(st) ≡ "{\"state\":\"starting\",\"model\":null}"
+    }
+    test "health body ready carries model identity" {
+        const ServerState st ← admitted(new_state("/models/x.gguf"), "2fa3f013")
+        assert health_body(st) ≡ "{\"state\":\"ready\",\"model\":{\"sha256\":\"2fa3f013\",\"path\":\"/models/x.gguf\"}}"
+    }
+    test "health body failed carries typed cause" {
+        const ServerState st ← failed(new_state("/missing.gguf"), "io error: No such file")
+        assert health_body(st) ≡ "{\"state\":\"failed\",\"model\":{\"error\":\"io error: No such file\"}}"
+    }
+    test "exit code decision maps failed to 2" {
+        assert exit_code_for("failed") ≡ 2
+        assert exit_code_for("ready") ≡ 0
+        assert exit_code_for("starting") ≡ 0
     }
 }

@@ -1,0 +1,69 @@
+# =============================================================================
+# admission-gate — executable proof of the U2 admission path (I1 U2)
+# =============================================================================
+#
+# This no-host harness runs the real `model:admit` route (the BD-2 execution
+# bridge over the faber-runtime pinned-row engine) on one GGUF path and mirrors
+# the D5 process exit contract:
+#
+#   exit 0 — admission succeeded; the verified whole-file SHA-256 is printed.
+#   exit 2 — admission failed; the typed cause (io / size / structure / SHA-256
+#            mismatch) is printed.
+#
+# It is deliberately buildable on the installed faber toolchain: it does not
+# set `[target.rust] host = "native"`, so no native host crates are linked and
+# the faber-runtime package-collision that blocks the server binary does not
+# arise here. It never calls `model:forward` / `model:generate`, so no weight
+# materialization happens on this path (the U2 "no weight materialization on
+# failure" gate).
+#
+# The server (src/main.fab) declares the same binding and drives the same
+# lifecycle transitions; its binary link is blocked on the recorded toolchain
+# staleness (see src/main.fab and the U2 closeout).
+#
+# Usage: admission-gate <model-path>
+# The failure fixtures (missing / truncated copy / digest-mismatch copy) are
+# prepared in a test tmpdir and validated by the U2 validation script.
+
+import from "model:model" private model
+
+# The pinned row's verified whole-file SHA-256 (gi0-model-contract v1.0.0 §1;
+# i1-discovery.md identity table).
+fn pinned_sha() → string {
+    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+}
+
+fn stdout_write(string text) → void {
+    return call 'consolum:dic' (text) ↦ void
+}
+
+fn stderr_write(string text) → void {
+    return call 'consolum:mone' (text) ↦ void
+}
+
+# Never returns on success; the generated wrapper panics if it returns.
+fn exit_with(int code) → void {
+    return call 'processus:exi' (code) ↦ void
+}
+
+main args argv {
+    if argv.longitudo() < 2 {
+        stderr_write("usage: admission-gate <model-path>\n")
+        exit_with(1)
+    }
+    const string path ← argv.accipe(1) coalesce ""
+    fac {
+        const string sha ← model.admit(path)
+        stdout_write("admitted: " + sha + "\n")
+        if sha ≡ pinned_sha() {
+            stdout_write("PASS admission: digest equals the pinned row (2fa3f013…)\n")
+        } else {
+            stdout_write("FAIL admission: digest " + sha + " does not equal the pinned row\n")
+            exit_with(2)
+        }
+    }
+    cape err {
+        stdout_write("rejected: §"(err) + "\n")
+        exit_with(2)
+    }
+}

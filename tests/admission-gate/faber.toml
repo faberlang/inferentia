@@ -1,5 +1,5 @@
 [package]
-name = "inferentia"
+name = "admission-gate"
 version = "0.1.0"
 edition = "2026"
 
@@ -13,9 +13,6 @@ kind = "bin"
 
 [dependencies]
 model = "0.1.0"
-
-[target.rust]
-host = "native"
 
 [locale]
 locale = "en"
