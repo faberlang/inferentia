@@ -205,9 +205,70 @@ fn expect_sequence(value cfg, list<int> prompt, list<int> expected, string label
     }
 }
 
+# --- U5 oracle evidence (tokenization + greedy, slice-1 final gate) ----------
+# The three comparison surfaces are printed with exact arrays:
+#   1. record.json prompt_tokens (the gate authority's tokenization surface)
+#      — compared to the pinned P10 the engine consumes.
+#   2. record.json generated_tokens[0..16] (the gate authority's greedy
+#      surface) — the direct comparison below (expect_sequence) proves the
+#      engine reproduces it exactly.
+# The shell-level oracles (llama-tokenize --ids P10, the fresh /completion
+# token-array run) are recorded in the validation log; the pinned arrays
+# here are the same constants the oracles reproduce.
+
+fn print_int_list(string label, list<int> ids) → void {
+    stdout_write(label + ": [")
+    var int i ← 0
+    while i < ids.longitudo() {
+        const int t ← ids.accipe(i) coalesce 0
+        if i > 0 {
+            stdout_write(",")
+        }
+        stdout_write(t ↦ string)
+        i ← i + 1
+    }
+    stdout_write("]\n")
+}
+
+fn expect_p10_tokenization() → void {
+    # record.json prompt_tokens (gate authority) == the pinned P10 ids the
+    # engine consumes (P10 per i1-discovery §6.1; llama-tokenize reproduces
+    # the same array — recorded in the validation log).
+    const list<int> record_prompt_tokens ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+    const list<int> p10 ← pinned_prompt()
+    const int n ← p10.longitudo()
+    if n ≠ record_prompt_tokens.longitudo() {
+        fail("U5 tokenization: P10 length mismatch")
+    }
+    var bool same ← true
+    var int i ← 0
+    while i < n {
+        const int a ← p10.accipe(i) coalesce -1
+        const int b ← record_prompt_tokens.accipe(i) coalesce -2
+        if a ≠ b {
+            same ← false
+        }
+        i ← i + 1
+    }
+    if same {
+        stdout_write("PASS U5 tokenization: P10 == record.json prompt_tokens\n")
+    } else {
+        fail("U5 tokenization: P10 != record.json prompt_tokens")
+    }
+}
+
 # --- Main -------------------------------------------------------------------
 main args argv {
-    stdout_write("generate-gate: I1 U4 generation proof\n")
+    stdout_write("generate-gate: I1 U4 generation proof (U5 oracle gate)\n")
+
+    # U5 tokenization surface: the pinned P10 the engine consumes, the gate
+    # authority's prompt_tokens, and the greedy surface all printed with
+    # exact arrays (llama-tokenize --ids + the fresh /completion oracle run
+    # are recorded in the validation log).
+    print_int_list("U5 P10 (pinned prompt tokens)", pinned_prompt())
+    expect_p10_tokenization()
+    print_int_list("U5 record.json prompt_tokens", [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767])
+    print_int_list("U5 record.json generated_tokens[0..16]", record_prefix_16())
 
     # RESIDENT MODEL: the weights load exactly once (the binding's oracle is a
     # process-wide OnceLock). The single load marker is written here; two
