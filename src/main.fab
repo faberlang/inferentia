@@ -1,10 +1,14 @@
 # =============================================================================
-# Inferentia — local GGUF inference server (I1 U1 + U2 + U4)
+# Inferentia — local GGUF inference server (I1 U1 + U2 + U3 + U4)
 # =============================================================================
 #
 # U1 scope: `serve` CLI parsing (D1), configuration precedence (D2), and host
 # bootstrap — bind a loopback listener, answer `/health`, and exit on usage
 # errors before any listener binds.
+#
+# U3 scope: the `/model` endpoint — the pinned-row identity facts (D3 schema)
+# assembled from the BD-2 admit sha256 + documented constants, with 503 before
+# ready.
 #
 # U2 scope: admission at startup + health lifecycle — the listener binds
 # first, `admit` runs before any allocation, and `/health` serves
@@ -987,6 +991,72 @@ fn health_body(ServerState st) → string {
     return "{\"state\":\"ready\",\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"}}"
 }
 
+# ---------------------------------------------------------------------------
+# U3 — /model endpoint
+#
+# The pinned-row identity facts (i1-discovery §2.1 identity table; D3 schema).
+# `sha256` is the one runtime fact — from the BD-2 admit route, held in
+# ServerState. Every other field is a documented constant for the pinned
+# SmolLM2-360M-Instruct-Q4_K_M row; `max_output_tokens` is the server default
+# (D2 precedence — the configured `--max-tokens` value, not a per-request
+# value). Field order is the D3 order: name, architecture, quantization,
+# file_size_bytes, sha256, context_length, vocab_size, max_output_tokens,
+# backend.
+# ---------------------------------------------------------------------------
+fn model_identity_name() → string {
+    return "SmolLM2-360M-Instruct-Q4_K_M"
+}
+
+fn model_architecture() → string {
+    return "llama"
+}
+
+fn model_quantization() → string {
+    return "q4_k_m"
+}
+
+fn model_file_size_bytes() → int {
+    return 270590880
+}
+
+fn model_vocab_size() → int {
+    return 49152
+}
+
+fn model_backend() → string {
+    return "cpu"
+}
+
+# The /model response body (D3 exact schema). `sha256` is JSON-escaped for
+# consistency with the other identity bodies (hex, so normally a no-op).
+fn model_body(ServerState st, int max_output_tokens) → string {
+    return "{\"name\":\"" + model_identity_name() + "\",\"architecture\":\"" + model_architecture() + "\",\"quantization\":\"" + model_quantization() + "\",\"file_size_bytes\":" + (model_file_size_bytes() ↦ string) + ",\"sha256\":\"" + json_escape(st.sha256) + "\",\"context_length\":" + (model_context_limit() ↦ string) + ",\"vocab_size\":" + (model_vocab_size() ↦ string) + ",\"max_output_tokens\":" + (max_output_tokens ↦ string) + ",\"backend\":\"" + model_backend() + "\"}"
+}
+
+# D3: 503 before ready / on failure carries the minimal state body
+# (`{"state":"starting"|"failed"}` — the typed cause is served by /health).
+fn model_unready_body(ServerState st) → string {
+    return "{\"state\":\"" + st.state + "\"}"
+}
+
+# Handle a /model request (U3). The pipeline: method gate → state gate →
+# response assembly. GET is the only method (D3); any other method is a
+# reject. Before ready the endpoint answers 503 with the state; on ready it
+# answers 200 with the exact pinned identity body.
+fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
+    const value vm ← tab.accipe("method")
+    const string method ← vm ↦ string
+    if method ≠ "GET" {
+        http_respond(id, 400, error_body("method must be GET for /model"))
+        return
+    }
+    if st.state ≠ "ready" {
+        http_respond(id, 503, model_unready_body(st))
+        return
+    }
+    http_respond(id, 200, model_body(st, config.max_tokens))
+}
+
 # Handle a /generate request (U4). The pipeline: method gate → state gate →
 # cancellation checkpoint → body read → minimal JSON parse → cancellation
 # checkpoint → encode → engine generate (prefill + greedy decode with the
@@ -1062,6 +1132,8 @@ fn handle_request(value request, ServerState st, ServeConfig config) → void {
         const string path ← via ↦ string
         if path ≡ "/health" {
             http_respond(id, 200, health_body(st))
+        } elif path ≡ "/model" {
+            handle_model(tab, st, config, id)
         } elif path ≡ "/generate" {
             handle_generate(tab, st, config, id)
         } else {
@@ -1450,5 +1522,39 @@ describe "generate response" tag "inferentia" {
         const int first ← eog.accipe(0) coalesce -1
         const int second ← eog.accipe(1) coalesce -1
         assert (first ≡ 0) and (second ≡ 2)
+    }
+}
+describe "model endpoint" tag "inferentia" {
+    test "pinned identity constants match the discovery facts" {
+        assert model_identity_name() ≡ "SmolLM2-360M-Instruct-Q4_K_M"
+        assert model_architecture() ≡ "llama"
+        assert model_quantization() ≡ "q4_k_m"
+        assert model_file_size_bytes() ≡ 270590880
+        assert model_vocab_size() ≡ 49152
+        assert model_backend() ≡ "cpu"
+        assert model_context_limit() ≡ 8192
+    }
+    test "model body matches the committed expected body at the server default" {
+        # Exact D3 wire format (field order, no whitespace) — the same literal
+        # committed as tests/model-gate/expected-model-body.json, which the
+        # live curl proof diffs against.
+        const ServerState st ← admitted(new_state("/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf"), "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert model_body(st, 32) ≡ "{\"name\":\"SmolLM2-360M-Instruct-Q4_K_M\",\"architecture\":\"llama\",\"quantization\":\"q4_k_m\",\"file_size_bytes\":270590880,\"sha256\":\"2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
+    }
+    test "model body reflects the configured max_output_tokens" {
+        const ServerState st ← admitted(new_state("/m.gguf"), "2fa3f013")
+        assert model_body(st, 16).continet("\"max_output_tokens\":16")
+        assert model_body(st, 1).continet("\"max_output_tokens\":1")
+    }
+    test "model unready body carries the state" {
+        assert model_unready_body(new_state("/m.gguf")) ≡ "{\"state\":\"starting\"}"
+        const ServerState st ← failed(new_state("/m.gguf"), "io error: No such file")
+        assert model_unready_body(st) ≡ "{\"state\":\"failed\"}"
+    }
+    test "model body escapes the admitted sha256" {
+        # json_escape is applied to the sha256 (a no-op for hex, but the body
+        # stays valid JSON under any future identity source).
+        const ServerState st ← admitted(new_state("/m.gguf"), "a\"b")
+        assert model_body(st, 32).continet("\"sha256\":\"a\\\"b\"")
     }
 }

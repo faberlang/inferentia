@@ -1,0 +1,153 @@
+# =============================================================================
+# model-gate — executable proof of the I1 U3 /model identity facts
+# =============================================================================
+#
+# This no-host harness mirrors the U3 `/model` endpoint contract. It drives
+# the real `model:admit` route (the BD-2 execution bridge over the
+# faber-runtime pinned-row engine) and verifies the identity facts the
+# `/model` body carries:
+#
+#   1. ADMISSION: admit returns the pinned row's whole-file SHA-256
+#      (2fa3f013…), the one runtime fact in the /model body.
+#   2. EXPECTED BODY: the D3 schema assembled from the admitted sha256 + the
+#      pinned documented constants (name, architecture, quantization,
+#      file_size_bytes, context_length, vocab_size, backend, max_output_tokens
+#      = server default) is byte-identical to the committed expected body
+#      (tests/model-gate/expected-model-body.json) — the same literal the
+#      live `curl localhost:8080/model` proof diffs against.
+#
+# The HTTP route itself (GET method gate, 503 before ready, 200 with the exact
+# body) is proven live by curling the running server binary; this gate proves
+# the engine + pinned facts the body is assembled from.
+#
+# It is deliberately buildable on the installed faber toolchain: it does not
+# set `[target.rust] host = "native"`, so no native host crates are linked and
+# the faber-runtime package-collision that blocks the server binary does not
+# arise here (same convention as tests/admission-gate and tests/generate-gate).
+#
+# Usage: model-gate <model-path>
+#
+# Exit: 0 on ALL PASS, 1 on any FAIL (a script can gate on the exit code).
+# Model identity: pinned SmolLM2-360M-Instruct-Q4_K_M.gguf (i1-discovery §2.1)
+#   size 270,590,880 bytes, sha256
+#   2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+
+import from "model:model" private model
+
+# --- I/O + exit ------------------------------------------------------------
+fn stdout_write(string text) → void {
+    return call 'consolum:dic' (text) ↦ void
+}
+
+fn stderr_write(string text) → void {
+    return call 'consolum:mone' (text) ↦ void
+}
+
+fn exit_with(int code) → void {
+    return call 'processus:exi' (code) ↦ void
+}
+
+fn fail(string why) → void {
+    stdout_write("FAIL " + why + "\n")
+    exit_with(1)
+}
+
+# --- Pinned facts (i1-discovery §2.1 identity table) -----------------------
+fn pinned_sha() → string {
+    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+}
+
+fn pinned_name() → string {
+    return "SmolLM2-360M-Instruct-Q4_K_M"
+}
+
+fn pinned_architecture() → string {
+    return "llama"
+}
+
+fn pinned_quantization() → string {
+    return "q4_k_m"
+}
+
+fn pinned_file_size_bytes() → int {
+    return 270590880
+}
+
+fn pinned_context_length() → int {
+    return 8192
+}
+
+fn pinned_vocab_size() → int {
+    return 49152
+}
+
+fn pinned_backend() → string {
+    return "cpu"
+}
+
+# The server default `--max-tokens` value (D1/D3: `max_output_tokens` is the
+# server default — the value a default `serve` run reports).
+fn server_default_max_output_tokens() → int {
+    return 32
+}
+
+# The committed expected /model body — the exact literal of
+# tests/model-gate/expected-model-body.json (the live curl proof's diff
+# target). Kept as a string here because the no-host harness has no file-read
+# route (solum is a native-host provider); the two committed copies must stay
+# byte-identical and the exact-match check below proves the D3 assembly
+# reproduces that literal.
+fn expected_model_body() → string {
+    return "{\"name\":\"SmolLM2-360M-Instruct-Q4_K_M\",\"architecture\":\"llama\",\"quantization\":\"q4_k_m\",\"file_size_bytes\":270590880,\"sha256\":\"2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
+}
+
+# Assemble the D3 /model body from the admitted sha256 + pinned constants
+# (the same assembly the server's model_body performs).
+fn assemble_model_body(string sha, int max_output_tokens) → string {
+    return "{\"name\":\"" + pinned_name() + "\",\"architecture\":\"" + pinned_architecture() + "\",\"quantization\":\"" + pinned_quantization() + "\",\"file_size_bytes\":" + (pinned_file_size_bytes() ↦ string) + ",\"sha256\":\"" + sha + "\",\"context_length\":" + (pinned_context_length() ↦ string) + ",\"vocab_size\":" + (pinned_vocab_size() ↦ string) + ",\"max_output_tokens\":" + (max_output_tokens ↦ string) + ",\"backend\":\"" + pinned_backend() + "\"}"
+}
+
+# --- Main -------------------------------------------------------------------
+main args argv {
+    stdout_write("model-gate: I1 U3 /model identity proof\n")
+    if argv.longitudo() < 2 {
+        stderr_write("usage: model-gate <model-path>\n")
+        exit_with(1)
+    }
+    const string path ← argv.accipe(1) coalesce ""
+
+    # 1. Admission: the real BD-2 route returns the pinned row's SHA-256.
+    var string sha ← ""
+    var bool raised ← false
+    var string raise_error ← ""
+    fac {
+        const string s ← model.admit(path)
+        sha ← s
+    }
+    cape err {
+        raised ← true
+        raise_error ← err ↦ string
+    }
+    if raised {
+        fail("admit raised: " + raise_error)
+    }
+    if sha ≡ pinned_sha() {
+        stdout_write("PASS admission: sha256 equals the pinned row (2fa3f013…)\n")
+    } else {
+        fail("admission sha256 " + sha + " does not equal the pinned row")
+    }
+
+    # 2. The D3 /model body assembled from the admitted sha + pinned facts.
+    const string assembled ← assemble_model_body(sha, server_default_max_output_tokens())
+    stdout_write("model body (assembled):\n" + assembled + "\n")
+
+    # 3. Exact match vs the committed expected body (same literal as
+    #    expected-model-body.json, the live curl proof's diff target).
+    if assembled ≡ expected_model_body() {
+        stdout_write("PASS /model body == committed expected body (exact)\n")
+    } else {
+        fail("assembled /model body does not equal the committed expected body")
+    }
+
+    stdout_write("MODEL GATE ALL PASS\n")
+}
