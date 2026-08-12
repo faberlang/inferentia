@@ -1,6 +1,6 @@
 # Inferentia Master Campaign
 
-**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1 serve CLI (45e8ec1) + BD-2 execution bridge (6d42d8d) landed; U2/U4/U5 unblocked; delivery amendment in (2654530)
+**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U4/U5 + D5-exit fix landed; BD-2 + native-dispatch fix landed in faber-runtime; remaining Slice-1 = U3/U6/U7/U8; BD-1 open (owner decision pending), BD-3 deferred, BD-4 open (Slice 2 blocked); U3+U7 in flight
 
 ## Summary
 
