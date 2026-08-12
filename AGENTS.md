@@ -12,9 +12,10 @@ truth. When they disagree, working code and observed behavior win.
 
 - Keep product policy in this repository.
 - Put reusable ML semantics in Gradus only when Inferentia proves the need.
-- Put compiler work in Radix and build-tool work in Faber.
+- Put compiler and Faber build-tool work in private Radix.
 - Put physical effects behind the appropriate Host provider.
-- Do not move Inferentia commands into the Faber CLI or `faber-runtime`.
+- Do not move Inferentia commands into the generic Faber CLI or public Faber
+  target API packages.
 - Do not make `llama.cpp` a production dependency. It is a comparison oracle.
 - Keep deployment and machine provisioning in a separate campaign.
 
@@ -41,4 +42,3 @@ Model-serving stages must record the exact model path, size, hash, GGUF
 metadata, command, request fixture, observed output, and comparison oracle.
 Do not start long model or integration runs without making their expected cost
 clear first.
-
