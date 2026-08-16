@@ -1,5 +1,10 @@
 # Inferentia Agent Guide
 
+**Workspace work mode.** Ordinary development is **direct** in this
+checkout on `main`. Worktree packets under `../worktrees/<lane>/` are
+optional Tugboat isolation. Do not stand up lanes unless the operator
+asked. Container law: [`../AGENTS.md`](../AGENTS.md).
+
 ## Project
 
 Inferentia is a separate Faber application product. It serves GGUF language
