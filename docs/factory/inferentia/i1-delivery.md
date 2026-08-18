@@ -217,24 +217,20 @@ blocked until the relevant proofs pass.
 
 ### BD-2 — Execution bridge: Faber app → pinned-row engine
 
-- **Why**: the engine (admission + forward + greedy) is Rust in faber-runtime;
-  compiled Faber code cannot call it today.
-- **What (recommended)**: expose the engine to Faber applications via
-  **faber-runtime library-provider bindings** (`[library] provider` +
-  `bindings/rust.toml`, sqlite precedent) — routes `model:admit(path)`,
-  `model:forward(tokens)`, `model:tokenize(text)` (once BD-1 exists),
-  `model:generate(config, prompt)` shaped by the Gradus contract vocabulary
-  (GeneratioConfigura nine fields, EOG {0,2}, reject-not-truncate). Fallback:
-  a `model:*` host provider in `hosts` — choose only if bindings prove
-  heavier (per-call valor marshaling for 49,152-logit vectors is the
-  differentiator).
-- **Narrow proof**: a compiled Faber probe calls `model:admit` on the SmolLM2
-  file → returns SHA-256 `2fa3f013…`; `model:forward` on the pinned 9 tokens →
-  logits digest equals the GI2 golden (`gi2-3-logits-golden/logits-pos0.json`);
-  three greedy tokens equal `record.json` prefix. Validation in the owning
-  repo: `cargo check -p faber-runtime` + `cargo nextest run -p faber-runtime`
-  (or the provider's crate); the Faber probe via `faber check .` + `faber
-  build .`.
+- **Superseded (provider ruling 2615e6a9, 2026-08-18)**. The vehicle is
+  **not** faber-runtime bindings and **not** a `model:*` host provider.
+  Gradus owns `admit` / `tokenize` / `generate` as public `gradus:*` routes.
+  Inferentia composes path→bytes (`solum:hauri`) + digest (`solum:digestio`)
+  → `gradus:model/gguf.admit`; tokenize is G3 `tokenizator.tokenize`;
+  generate is G2 `generatio.generate` / `generate_dense`. The
+  faber-runtime `model:*` repo is deleted (remote 404). Option B (a thin
+  `model` wrapper package) is rejected.
+- **Why (historical)**: compiled Faber code needed an execution bridge to
+  the old Rust engine. That engine died with the repo.
+- **What now**: consume gradus in-language. Do not reimplement the
+  decode/sample loop in Inferentia.
+- **Narrow proof**: `faber check .` on inferentia + the three test gates
+  (admission / generate / model) after the I-1/I-2 remapping.
 
 ### BD-3 — Library-proba execution vehicle (FMIR stepper / library-import gap)
 
@@ -351,8 +347,10 @@ schemas). Triggered by a second caller; becomes a required prerequisite in I2.
 
 ## 11. Open Questions
 
-1. BD-2 vehicle: library-provider bindings (recommended) vs `model:*` host
-   provider — operator decision; the fallback is documented.
+1. BD-2 vehicle: **settled by ruling 2615e6a9** — gradus is the provider
+   (`gradus:*` routes). Library-provider bindings and a `model:*` host
+   provider are both rejected. Engine is gradus in-language, not
+   faber-runtime bindings.
 2. BD-3 (library execution gap) is a large Radix/Faber delivery — confirm it
    is budgeted as a campaign prerequisite, or accept the deferred
    value-identity gate with the Rust engine as the I1 runtime.

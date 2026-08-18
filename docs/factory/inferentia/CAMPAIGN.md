@@ -1,6 +1,6 @@
 # Inferentia Master Campaign
 
-**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U3/U4/U5/U7 + D5-exit fix landed (U3 `d1c2a8f` + U7 `6c7082b` merged 2026-08-11); remaining Slice-1 = U6/U8; BD-1 open (owner decision pending), BD-3 deferred, BD-4 open (Slice 2 blocked); build blocked — `faber.lock` still pins deleted `../faber-runtime/model` (no live successor; `faber check` PKG001 exit 1)
+**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U3/U4/U5/U7 + D5-exit fix landed; remaining Slice-1 = U6/U8; provider ruling 2615e6a9 (A): gradus owns admit/tokenize/generate as `gradus:*` — I-1/I-2 remapped inferentia off deleted `faber-runtime/model`; BD-1 now G3 `tokenize` (tables not yet loaded from the admitted row — frozen-fixture fallback remains); BD-3 deferred; BD-4 open
 
 ## Summary
 
@@ -83,12 +83,14 @@ Completion gate:
 
 ## I1 — Small GGUF vertical slice
 
-**State**: Slice-1 product units U1–U5/U7 landed on `main` (U3/U7 2026-08-11);
-`faber check .` is red (PKG001) because `faber.lock` pins deleted
-`../faber-runtime/model` and that library-provider has no live successor.
-Remaining Slice-1 = U6/U8. Still blocked on BD-1 (tokenizer runtime), BD-3
-(library execution, deferred), BD-4 (Qwen row contract). BD-2's engine +
-`model:*` bindings died with the 2026-08-12 `faber-runtime` repo deletion.
+**State**: Slice-1 product units U1–U5/U7 landed on `main` (U3/U7 2026-08-11).
+Provider ruling 2615e6a9 (2026-08-18): gradus is the model provider — public
+`gradus:*` routes over its admission contract + decode + G2 generate + G3
+tokenize. Inferentia locks and imports remapped off deleted
+`../faber-runtime/model` (I-1/I-2). Remaining Slice-1 = U6/U8. BD-1 is now
+G3 `tokenizator.tokenize` (vocab/merge tables not yet loaded from the
+admitted row — frozen-fixture fallback remains). BD-3 deferred. BD-4 open
+(Slice 2 blocked). BD-2's faber-runtime `model:*` vehicle is superseded.
 
 ### Goal
 
