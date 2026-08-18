@@ -33,13 +33,20 @@
 # materializes the SmolLM2 dense weights, and calls
 # `generatio.generate_dense` for 16 tokens against the U5 golden.
 #
-# The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
-# no streaming. The `norma:http` server wrappers are not yet wired into the
-# Rust backend, so the provider routes are called directly here.
+# HTTP serving goes through `norma:http/server` (bind / accept / reply /
+# open_sse). Request bodies arrive as valor octeti; `value ↦ bytes` then
+# `bytes ↦ string` extracts UTF-8 JSON. `/generate` answers JSON by default.
+# `Accept: text/event-stream` or `?stream=1` emits one SSE event per token
+# (I1 minimal stream). Generation itself is still a batch call.
 #
 # The generated CLI framework is not used: its help/parse errors exit 0/2 and
 # cannot carry the D5 usage-error exit, so argv is parsed in this unit and
 # every usage error is detected before the listener binds.
+
+import from "norma:http/headers" headers
+import from "norma:http/request" httpreq
+import from "norma:http/server" server
+import from "norma:http/sse" sse
 
 import from "gradus:attention" attention
 import from "gradus:cache" kv
@@ -142,10 +149,10 @@ fn eog_stop_set() → list<int> {
     return [0, 2]
 }
 
-# The marker `request_body_text` returns while the valor→octeti extraction
-# gap is open. It is not valid JSON body content (non-ASCII delimiters), so
-# it cannot collide with a real request. (Functions, not top-level fixum —
-# generated consts cannot own String in this toolchain.)
+# The marker `request_body_text` returns when octeti→text decode fails
+# (invalid UTF-8). It is not valid JSON (non-ASCII delimiters), so it cannot
+# collide with a real request. (Functions, not top-level fixum — generated
+# consts cannot own String in this toolchain.)
 fn body_read_gap_marker() → string {
     return "⟪BODY-READ-GAP⟫"
 }
@@ -811,40 +818,73 @@ fn classify_generate_error(string err) → int {
     return 500
 }
 
-# Request-body extraction seam (U4). The http provider delivers the body as
-# valor octeti; the snapshot toolchain has no valor→octeti extraction
-# (`value ↦ bytes` fails codegen; `value ↦ string` fails at runtime on octeti
-# payloads — recorded toolchain gap, routed to radix/faber-runtime). Until it
-# lands, the marker is returned and the handler answers 500 with the typed
-# gap. The function signature needs no change when the gap closes.
+# Request-body extraction. The provider delivers valor octeti. `value ↦ bytes`
+# now extracts `Valor::Octeti`; UTF-8 decode is `bytes ↦ string`. A string
+# valor (tests / future text carriers) is taken as-is. The gap marker is only
+# for a failed octeti→text decode (invalid UTF-8).
 fn request_body_text(value body_value) → string {
-    return body_value ↦ string ⇥ body_read_gap_marker()
+    if body_value is string {
+        return body_value ↦ string
+    }
+    const bytes raw ← body_value ↦ bytes ⇥ ||
+    return raw ↦ string ⇥ body_read_gap_marker()
+}
+
+fn request_body_from_raw(value request) → string {
+    if request is map<string, value> {
+        const map<string, value> tab ← request ↦ map<string, value>
+        return request_body_text(tab.get("body"))
+    }
+    return body_read_gap_marker()
 }
 
 # ---------------------------------------------------------------------------
-# Host provider routes (physical effects live behind the hosts kernel).
-# Call forms match the provider manifests' declared opener contracts (bare
-# values for textus/numerus openers, lists for lista<valor> openers).
+# Host provider routes through `norma:http/server` (H6).
 # ---------------------------------------------------------------------------
 
-# Bind a loopback HTTP/1.1 listener and return its opaque handle.
-fn http_listen(int port) → int {
-    return call 'http:listen' ([port]) ↦ int
+fn json_headers() → headers.Headers {
+    var headers.Headers head ← headers.empty()
+    if head.append("content-type", "application/json") {
+    }
+    return head
 }
 
-# Accept one bounded request; the carrier is a map with id/method/path/headers/body.
-fn http_accept(int handle) → value {
-    return call 'http:accept' (handle) ↦ value
+fn reply_json(server.Incoming incoming, int status, string body) → void {
+    server.reply(incoming, status, json_headers(), body)
 }
 
-# Write one response for a pending request id.
-fn http_respond_raw(list<value> args) → void {
-    return call 'http:respond' (args) ↦ void
+fn wants_sse(server.Incoming incoming) → bool {
+    const string ∪ null accept ← incoming.req.header("accept")
+    if accept not is null {
+        const string a ← accept ↦ string
+        if a.contains("text/event-stream") {
+            return true
+        }
+    }
+    const string ∪ null stream ← incoming.req.query_field("stream")
+    if stream not is null {
+        const string s ← stream ↦ string
+        if s ≡ "1" or s ≡ "true" {
+            return true
+        }
+    }
+    return false
 }
 
-fn http_respond(string request_id, int status, string body) → void {
-    const list<map<string, string>> headers ← [{"name": "content-type", "value": "application/json"}]
-    http_respond_raw([request_id, status, headers, body])
+# One SSE `token` event per generated id, then a `done` event with the JSON
+# body. Generation is still a batch call; this is the I1 wire stream.
+fn send_generate_stream(server.Incoming incoming, ServerState st, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
+    const server.Stream stream ← server.open_sse(incoming)
+    var int i ← 0
+    while i < tokens.length() {
+        const int t ← tokens.get(i) coalesce 0
+        const sse.Event ev ← sse.Event { name = "token", data = t ↦ string, id = "", retry = "" }
+        server.send_event(stream, ev)
+        i ← i + 1
+    }
+    const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, tokens, prompt_ids, max_tokens), id = "", retry = "" }
+    server.send_event(stream, done)
+    server.finish_stream(stream, server.keep_alive(incoming.req.headers))
 }
 
 # Write text to stdout without a trailing newline.
@@ -1685,18 +1725,16 @@ fn model_unready_body(ServerState st) → string {
 # response assembly. GET is the only method (D3); any other method is a
 # reject. Before ready the endpoint answers 503 with the state; on ready it
 # answers 200 with the exact pinned identity body.
-fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
-    const value vm ← tab.get("method")
-    const string method ← vm ↦ string
-    if method ≠ "GET" {
-        http_respond(id, 400, error_body("method must be GET for /model"))
+fn handle_model(server.Incoming incoming, ServerState st, ServeConfig config) → void {
+    if incoming.req.method ≠ "GET" {
+        reply_json(incoming, 400, error_body("method must be GET for /model"))
         return
     }
     if st.state ≠ "ready" {
-        http_respond(id, 503, model_unready_body(st))
+        reply_json(incoming, 503, model_unready_body(st))
         return
     }
-    http_respond(id, 200, model_body(st, config.max_tokens))
+    reply_json(incoming, 200, model_body(st, config.max_tokens))
 }
 
 # Handle a /generate request (U4). The pipeline: method gate → state gate →
@@ -1705,46 +1743,44 @@ fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, stri
 # pinned EOG stop set and the max_tokens budget) → response assembly.
 # Domain validation (the gradus reject rows) is enforced by the engine with
 # typed causes; this unit maps them to 400/500.
-fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, ResidentModel model, string id) → void {
+fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeConfig config, ResidentModel model) → void {
     # Method gate: /generate is POST (D3).
-    const value vm ← tab.get("method")
-    const string method ← vm ↦ string
-    if method ≠ "POST" {
-        http_respond(id, 400, error_body("method must be POST for /generate"))
+    if incoming.req.method ≠ "POST" {
+        reply_json(incoming, 400, error_body("method must be POST for /generate"))
         return
     }
     # State gate: 503 before ready (D3).
     if st.state ≠ "ready" {
-        http_respond(id, 503, state_body(st))
+        reply_json(incoming, 503, state_body(st))
         return
     }
     # Cancellation checkpoint (D6 seam; no signal source is wired yet — the
     # native host has no processus signal route, a recorded U6 gap).
     if st.cancelled {
-        http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+        reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
         return
     }
-    # Body read (the toolchain seam — see request_body_text).
-    const value bv ← tab.get("body")
-    const string body ← request_body_text(bv)
+    # Body from the raw accept valor (Incoming.req.body drops octeti in
+    # server._body_text). `value ↦ bytes` extracts the provider octeti.
+    const string body ← request_body_from_raw(raw)
     if body ≡ body_read_gap_marker() {
-        http_respond(id, 500, error_body("request body unavailable: the valor→octeti extraction is a recorded toolchain gap (routed to radix/faber-runtime); no /generate request can be read until it lands"))
+        reply_json(incoming, 500, error_body("request body unavailable: octeti→text decode failed"))
         return
     }
     # Minimal product JSON parse (D3).
     const GenerateRequest parsed ← json_parse_generate_body(body)
     if not parsed.ok {
-        http_respond(id, 400, error_body(parsed.error))
+        reply_json(incoming, 400, error_body(parsed.error))
         return
     }
     if st.cancelled {
-        http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+        reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
         return
     }
     # Encode: text → token ids (BD-1 absent → pinned frozen-fixture row).
     const EncodeResult enc ← encode_prompt(parsed.prompt)
     if not enc.ok {
-        http_respond(id, 400, error_body(enc.error))
+        reply_json(incoming, 400, error_body(enc.error))
         return
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
@@ -1752,15 +1788,17 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, R
         const list<int> tokens ← run_generate(cfg, enc.ids, model, generatio.eog_stop())
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
-            http_respond(id, 503, error_body("generation cancelled (shutdown)"))
+            reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
+        } elif wants_sse(incoming) {
+            send_generate_stream(incoming, st, tokens, enc.ids, cfg.maxima_verborum)
         } else {
-            http_respond(id, 200, generate_response_body(st, tokens, enc.ids, cfg.maxima_verborum))
+            reply_json(incoming, 200, generate_response_body(st, tokens, enc.ids, cfg.maxima_verborum))
         }
     }
     catch err {
         const string cause ← generatio.message(err)
         const int code ← classify_generate_error(cause)
-        http_respond(id, code, error_body(cause))
+        reply_json(incoming, code, error_body(cause))
     }
 }
 
@@ -1768,19 +1806,16 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, R
 # up; /generate is the U4 endpoint; any other path is 404 (D3).
 fn handle_request(value request, ServerState st, ServeConfig config, ResidentModel model) → void {
     if request is map<string, value> {
-        const map<string, value> tab ← request ↦ map<string, value>
-        const value vid ← tab.get("id")
-        const string id ← vid ↦ string
-        const value via ← tab.get("path")
-        const string path ← via ↦ string
+        const server.Incoming incoming ← server.incoming_of(request)
+        const string path ← incoming.req.path
         if path ≡ "/health" {
-            http_respond(id, 200, health_body(st))
+            reply_json(incoming, 200, health_body(st))
         } elif path ≡ "/model" {
-            handle_model(tab, st, config, id)
+            handle_model(incoming, st, config)
         } elif path ≡ "/generate" {
-            handle_generate(tab, st, config, model, id)
+            handle_generate(incoming, request, st, config, model)
         } else {
-            http_respond(id, 404, "not found")
+            reply_json(incoming, 404, "not found")
         }
     }
 }
@@ -1802,7 +1837,7 @@ fn serve(ServeConfig config) → void {
     # U2 admission ordering: bind first, then admit BEFORE any allocation.
     # Weight materialization is out of this path: admit only verifies the
     # digest and the pinned-row structure (BD-2 gate), never forward/generate.
-    const int listener ← http_listen(config.port)
+    const server.Listener listener ← server.bind(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
@@ -1855,7 +1890,7 @@ fn serve(ServeConfig config) → void {
     var bool serving ← true
     while serving {
         do {
-            const value request ← http_accept(listener)
+            const value request ← server.accept(listener.handle)
             handle_request(request, state, config, resident)
         }
         catch err {
@@ -2212,5 +2247,61 @@ describe "model endpoint" tag "inferentia" {
         # stays valid JSON under any future identity source).
         const ServerState st ← admitted(new_state("/m.gguf"), "a\"b")
         assert model_body(st, 32).contains("\"sha256\":\"a\\\"b\"")
+    }
+}
+describe "http module" tag "inferentia" {
+    test "server genera import from norma:http/server" {
+        const server.Listener listener ← server.Listener { handle = 1 }
+        const server.Incoming incoming ← server.Incoming {
+            id = "http-1",
+            connection = 2,
+            req = httpreq.Request { method = "GET", path = "/health", query = "", body = "" }
+        }
+        assert listener.handle ≡ 1
+        assert incoming.id ≡ "http-1"
+        assert incoming.connection ≡ 2
+        assert not wants_sse(incoming)
+    }
+    test "string valor body extracts as text" {
+        assert request_body_text("{\"prompt\":\"hi\"}" ↦ value) ≡ "{\"prompt\":\"hi\"}"
+    }
+    test "octeti valor body extracts as UTF-8 text" {
+        const bytes payload ← "{\"prompt\":\"hi\"}" ↦ bytes
+        const value v ← payload ↦ value
+        assert request_body_text(v) ≡ "{\"prompt\":\"hi\"}"
+    }
+    test "json headers carry content-type" {
+        const headers.Headers head ← json_headers()
+        const string ∪ null ct ← head.get("content-type")
+        assert ct not is null
+        assert (ct ↦ string) ≡ "application/json"
+    }
+    test "incoming_of splits stream query and wants sse" {
+        var map<string, value> raw ← {}
+        raw.put("id", "http-1" ↦ value)
+        raw.put("connection", 1 ↦ value)
+        raw.put("method", "POST" ↦ value)
+        raw.put("path", "/generate?stream=1" ↦ value)
+        raw.put("headers", [] ↦ value)
+        raw.put("body", "" ↦ value)
+        const server.Incoming incoming ← server.incoming_of(raw ↦ value)
+        assert incoming.req.path ≡ "/generate"
+        assert wants_sse(incoming)
+    }
+    test "accept text/event-stream wants sse" {
+        var map<string, value> raw ← {}
+        raw.put("id", "http-1" ↦ value)
+        raw.put("connection", 1 ↦ value)
+        raw.put("method", "POST" ↦ value)
+        raw.put("path", "/generate" ↦ value)
+        var map<string, value> row ← {}
+        row.put("name", "Accept" ↦ value)
+        row.put("value", "text/event-stream" ↦ value)
+        var list<value> hdrs ← []
+        hdrs.append(row ↦ value)
+        raw.put("headers", hdrs ↦ value)
+        raw.put("body", "" ↦ value)
+        const server.Incoming incoming ← server.incoming_of(raw ↦ value)
+        assert wants_sse(incoming)
     }
 }
