@@ -13,10 +13,9 @@
 # U2 scope: admission at startup + health lifecycle — the listener binds
 # first, `admit` runs before any allocation, and `/health` serves
 # `starting` → `ready` (with model identity) or `failed` (with the typed
-# cause). No weight materialization happens on this path: only `model:admit`
-# (digest verification first, then structure validation — the BD-2 execution
-# bridge over the faber-runtime pinned-row engine) is called; `forward` /
-# `generate` are never invoked here.
+# cause). No weight materialization happens on this path: only the
+# admission contract (`solum:digestio` + `solum:hauri` → `gradus:model/gguf`
+# admit) is called; `forward` / `generate` are never invoked here.
 #
 # U4 scope: the `/generate` endpoint — request parse (minimal product JSON
 # per D3), field validation via the gradus reject rows (imperium_admissum,
@@ -24,8 +23,9 @@
 # (encode → the engine's prefill + greedy decode with the pinned EOG stop set
 # {0,2} and the max_tokens budget), cancellation checkpoints (D6 seam), and
 # the resident-model proof (weights load exactly once; stderr records the
-# single load). The generation loop itself lives behind `model:generate`
-# (the BD-2 execution bridge); this unit owns the request pipeline around it.
+# single load). The generation loop itself lives behind
+# `gradus:generation.generate` (G2); this unit owns the request pipeline
+# around it.
 #
 # The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
 # no streaming. The `norma:http` server wrappers are not yet wired into the
@@ -34,6 +34,12 @@
 # The generated CLI framework is not used: its help/parse errors exit 0/2 and
 # cannot carry the D5 usage-error exit, so argv is parsed in this unit and
 # every usage error is detected before the listener binds.
+
+import from "gradus:decode" decode
+import from "gradus:generation" generatio
+import from "gradus:model/capsule" capsula
+import from "gradus:model/gguf" gguf
+import from "gradus:tokenizer" tokenizator
 
 # ---------------------------------------------------------------------------
 # Serve configuration (D1 syntax + D2 precedence)
@@ -55,9 +61,6 @@ class ServeConfig {
 # ---------------------------------------------------------------------------
 # Admission lifecycle state (D3 health states: starting | ready | failed)
 # ---------------------------------------------------------------------------
-
-# The pinned-row engine's admission route (BD-2 execution bridge).
-import from "model:model" private model
 
 class ServerState {
     string state
@@ -303,9 +306,9 @@ fn json_fail(string error, int pos) → JsonScalar {
 
 # One UTF-8 character at the cursor ("" past the end).
 fn json_char(JsonCursor c) → string {
-    const int len ← c.text.longitudo()
+    const int len ← c.text.length()
     if c.pos ≥ len { return "" }
-    return c.text.sectio(c.pos, c.pos + 1)
+    return c.text.slice(c.pos, c.pos + 1)
 }
 
 fn json_skip_ws(JsonCursor c) → JsonCursor {
@@ -453,7 +456,7 @@ fn json_parse_number(JsonCursor c) → JsonScalar {
     if is_float and (token_len > 24) {
         return json_fail("malformed JSON: number too long", cur.pos)
     }
-    const string token ← body_text.sectio(start, cur.pos)
+    const string token ← body_text.slice(start, cur.pos)
     if is_float {
         const float fv ← token ↦ float ⇥ 0.0
         return JsonScalar { ok = true, error = "", kind = 3, text = token, int_value = 0, float_value = fv, pos = cur.pos }
@@ -612,7 +615,7 @@ fn json_parse_generate_body(string body) → GenerateRequest {
 
     # No trailing content allowed.
     const JsonCursor end ← json_skip_ws(cur)
-    if end.pos < body_text.longitudo() {
+    if end.pos < body_text.length() {
         return rejected_generate_request("malformed JSON: trailing content after object")
     }
     if not out.has_prompt {
@@ -684,9 +687,11 @@ class EncodeResult {
     list<int> ids
 }
 
-# Text → token ids (the "encode" phase). model.tokenize is the real encoder
-# once BD-1 lands; today it rejects and the pinned fallback serves the frozen
-# fixture. One verified prompt row, never silent generalization (fail closed).
+# Text → token ids (the "encode" phase). G3 `tokenizator.tokenize` is the
+# encoder; it needs vocab/merge tables from the admitted row. Those tables
+# are not loaded here yet, so tokenize fails closed and the pinned fallback
+# serves the frozen fixture. One verified prompt row, never silent
+# generalization.
 #
 # The fallback conditional lives in a separate function: the MIR stepper
 # (`faber test`) cannot lower a conditional inside a `cape` block that wraps a
@@ -698,13 +703,19 @@ fn encode_fallback(string prompt, string bind_error) → EncodeResult {
     return EncodeResult { ok = false, error = "prompt encode unavailable: " + bind_error, ids = [] }
 }
 
+# G3 tokenize needs a Tokenizer. Empty tables fail closed (G3 contract).
+fn encode_tokenizer() → tokenizator.Tokenizer ⇥ tokenizator.TokenizerError {
+    return tokenizator.build_tables([], [], [], [])
+}
+
 fn encode_prompt(string prompt) → EncodeResult {
-    fac {
-        const list<int> ids ← model.tokenize(prompt)
+    do {
+        const tokenizator.Tokenizer t ← encode_tokenizer()
+        const list<int> ids ← tokenizator.tokenize(t, prompt)
         return EncodeResult { ok = true, error = "", ids = ids }
     }
-    cape err {
-        return encode_fallback(prompt, err ↦ string)
+    catch err {
+        return encode_fallback(prompt, tokenizator.message(err))
     }
 }
 
@@ -718,9 +729,9 @@ fn encode_prompt(string prompt) → EncodeResult {
 fn tokens_text(list<int> tokens) → string {
     var string out ← ""
     var int i ← 0
-    while i < tokens.longitudo() {
+    while i < tokens.length() {
         if i > 0 { out ← out + " " }
-        const int t ← tokens.accipe(i) coalesce 0
+        const int t ← tokens.get(i) coalesce 0
         out ← out + (t ↦ string)
         i ← i + 1
     }
@@ -730,9 +741,9 @@ fn tokens_text(list<int> tokens) → string {
 fn tokens_json(list<int> tokens) → string {
     var string out ← "["
     var int i ← 0
-    while i < tokens.longitudo() {
+    while i < tokens.length() {
         if i > 0 { out ← out + "," }
-        const int t ← tokens.accipe(i) coalesce 0
+        const int t ← tokens.get(i) coalesce 0
         out ← out + (t ↦ string)
         i ← i + 1
     }
@@ -751,8 +762,8 @@ fn finish_reason(int generated, int max_tokens) → string {
 # held by this server (sha256 + path); the full /model identity surface is
 # U3 (not yet landed).
 fn generate_response_body(ServerState st, list<int> tokens, list<int> prompt_ids, int max_tokens) → string {
-    const int pn ← prompt_ids.longitudo()
-    const int cn ← tokens.longitudo()
+    const int pn ← prompt_ids.length()
+    const int cn ← tokens.length()
     const int total ← pn + cn
     const string reason ← finish_reason(cn, max_tokens)
     return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + tokens_text(tokens) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
@@ -764,7 +775,7 @@ fn generate_response_body(ServerState st, list<int> tokens, list<int> prompt_ids
 # order matters: backslashes first, then quotes, then control characters —
 # reversing the first two would double the inserted backslashes.
 fn json_escape(string s) → string {
-    return s.muta("\\", "\\\\").muta("\"", "\\\"").muta("\n", "\\n").muta("\r", "\\r").muta("\t", "\\t")
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
 
 fn error_body(string error) → string {
@@ -776,12 +787,11 @@ fn state_body(ServerState st) → string {
     return "{\"state\":\"" + st.state + "\",\"error\":\"" + json_escape(st.error_text) + "\"}"
 }
 
-# model:generate error → HTTP status. The request-side causes are the gradus
-# reject rows (typed ConfiguraInvalida/Terminus causes surfaced by the engine
-# — "config" domains, the greedy-only rule, prompt fit, the context cursor);
-# engine-side failures (prefill/forward/decode, oracle build) are 500.
+# G2 generate / construct_generation error → HTTP status. Request-side
+# causes are the typed ConfiguraInvalida rows (field domains, prompt fit,
+# the context cursor). Engine-side failures (prefill/forward/decode) are 500.
 fn classify_generate_error(string err) → int {
-    if err.initium("model:generate config") or err.initium("model:generate unknown") or err.initium("model:generate implements") or err.initium("model:generate needs at least one prompt token") or err.initium("model:generate prompt length") or err.initium("model:generate context limit") {
+    if err.starts_with("maximum generated tokens") or err.starts_with("needs at least one prompt token") or err.starts_with("prompt length") or err.starts_with("seed must") or err.starts_with("temperature must") or err.starts_with("top-p must") or err.starts_with("top-k must") or err.starts_with("min-p must") or err.starts_with("repetition penalty") or err.starts_with("context length") or err.starts_with("prompt batch") or err.starts_with("malformed generation") or err.starts_with("unknown generation") {
         return 400
     }
     return 500
@@ -842,6 +852,51 @@ fn exit_with(int code) → void {
 }
 
 # ---------------------------------------------------------------------------
+# Gradus provider composition (ruling 2615e6a9)
+#
+# Admit: path → solum:digestio + solum:hauri → gguf.admit (pinned SmolLM2
+# counts). Tokenize: G3. Generate: G2 generate over an admitted decoder.
+# ---------------------------------------------------------------------------
+
+# Pinned SmolLM2 row counts (gi0-model-contract / gguf.proba).
+fn pinned_expect_kv() → int { return 37 }
+fn pinned_expect_tensors() → int { return 290 }
+fn pinned_expect_elements() → int { return 361821120 }
+fn pinned_expect_f32() → int { return 65 }
+fn pinned_expect_q4k() → int { return 16 }
+fn pinned_expect_q5() → int { return 176 }
+fn pinned_expect_q6() → int { return 16 }
+fn pinned_expect_q8() → int { return 17 }
+
+fn bytes_as_u8(bytes raw) → list<int<u8>> {
+    var list<int<u8>> out ← []
+    var int i ← 0
+    while i < raw.length() {
+        out.append(raw.get(i) coalesce (0 ∷ int<u8>))
+        i ← i + 1
+    }
+    return out
+}
+
+# Path → host digest + bytes → gradus admit. Returns the carried digest.
+fn admit_model(string path) → string ⇥ gguf.GgufError {
+    const string digest ← call 'solum:digestio' (path) ↦ string
+    const bytes raw ← call 'solum:hauri' (path) ↦ bytes
+    const list<int<u8>> data ← bytes_as_u8(raw)
+    const capsula.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
+    return cap.digest()
+}
+
+fn to_generation_config(GenerateConfig cfg) → generatio.GenerationConfig ⇥ generatio.GeneratioError {
+    return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
+}
+
+fn run_generate(GenerateConfig cfg, list<int> ids) → list<int> ⇥ generatio.GeneratioError {
+    const generatio.GenerationConfig g ← to_generation_config(cfg)
+    return generatio.generate(g, ids, decode.default())
+}
+
+# ---------------------------------------------------------------------------
 # Usage errors (D5): detected before any listen, non-zero exit.
 # ---------------------------------------------------------------------------
 fn usage_error(string message) → never {
@@ -884,8 +939,8 @@ fn parse_cli(list<string> argv) → ServeConfig {
     var string subcommand ← ""
     var int i ← 1
 
-    while i < argv.longitudo() {
-        const string arg ← argv.accipe(i) coalesce ""
+    while i < argv.length() {
+        const string arg ← argv.get(i) coalesce ""
         if arg ≡ "--help" or arg ≡ "-h" {
             print_help()
             panic "help requested"
@@ -896,57 +951,57 @@ fn parse_cli(list<string> argv) → ServeConfig {
         }
         elif arg ≡ "--model" or arg ≡ "-m" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --model")
-            config.model ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --model")
+            config.model ← argv.get(i) coalesce ""
         }
         elif arg ≡ "--host" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --host")
-            config.host ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --host")
+            config.host ← argv.get(i) coalesce ""
         }
         elif arg ≡ "--port" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --port")
-            const string raw ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --port")
+            const string raw ← argv.get(i) coalesce ""
             const int port ← parse_int(raw)
             if port < 0 or port > 65535 then usage_error("invalid port '" + raw + "' (expected 0..=65535)")
             config.port ← port
         }
         elif arg ≡ "--max-tokens" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --max-tokens")
-            const string raw ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --max-tokens")
+            const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
             if value < 1 then usage_error("invalid max-tokens '" + raw + "' (expected >= 1)")
             config.max_tokens ← value
         }
         elif arg ≡ "--context" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --context")
-            const string raw ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --context")
+            const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
             if value < 1 then usage_error("invalid context '" + raw + "' (expected >= 1)")
             config.context ← value
         }
         elif arg ≡ "--seed" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --seed")
-            const string raw ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --seed")
+            const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
             if value < 1 then usage_error("invalid seed '" + raw + "' (expected >= 1)")
             config.seed ← value
         }
         elif arg ≡ "--log-level" {
             i ← i + 1
-            if i ≥ argv.longitudo() then usage_error("missing value for --log-level")
-            const string raw ← argv.accipe(i) coalesce ""
+            if i ≥ argv.length() then usage_error("missing value for --log-level")
+            const string raw ← argv.get(i) coalesce ""
             if (raw ≡ "info") or (raw ≡ "warn") or (raw ≡ "error") {
                 config.log_level ← raw
             } else {
                 usage_error("invalid log-level '" + raw + "' (expected info|warn|error)")
             }
         }
-        elif arg.initium("-") and arg.longitudo() > 1 {
+        elif arg.starts_with("-") and arg.length() > 1 {
             usage_error("unknown option '" + arg + "'")
         }
         else {
@@ -1044,7 +1099,7 @@ fn model_unready_body(ServerState st) → string {
 # reject. Before ready the endpoint answers 503 with the state; on ready it
 # answers 200 with the exact pinned identity body.
 fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
-    const value vm ← tab.accipe("method")
+    const value vm ← tab.get("method")
     const string method ← vm ↦ string
     if method ≠ "GET" {
         http_respond(id, 400, error_body("method must be GET for /model"))
@@ -1065,7 +1120,7 @@ fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, stri
 # typed causes; this unit maps them to 400/500.
 fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
     # Method gate: /generate is POST (D3).
-    const value vm ← tab.accipe("method")
+    const value vm ← tab.get("method")
     const string method ← vm ↦ string
     if method ≠ "POST" {
         http_respond(id, 400, error_body("method must be POST for /generate"))
@@ -1083,7 +1138,7 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
         return
     }
     # Body read (the toolchain seam — see request_body_text).
-    const value bv ← tab.accipe("body")
+    const value bv ← tab.get("body")
     const string body ← request_body_text(bv)
     if body ≡ body_read_gap_marker() {
         http_respond(id, 500, error_body("request body unavailable: the valor→octeti extraction is a recorded toolchain gap (routed to radix/faber-runtime); no /generate request can be read until it lands"))
@@ -1106,8 +1161,8 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
         return
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
-    fac {
-        const list<int> tokens ← model.generate(cfg ↦ value, enc.ids)
+    do {
+        const list<int> tokens ← run_generate(cfg, enc.ids)
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             http_respond(id, 503, error_body("generation cancelled (shutdown)"))
@@ -1115,9 +1170,10 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
             http_respond(id, 200, generate_response_body(st, tokens, enc.ids, cfg.maxima_verborum))
         }
     }
-    cape err {
-        const int code ← classify_generate_error(err)
-        http_respond(id, code, error_body(err))
+    catch err {
+        const string cause ← generatio.message(err)
+        const int code ← classify_generate_error(cause)
+        http_respond(id, code, error_body(cause))
     }
 }
 
@@ -1126,9 +1182,9 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
 fn handle_request(value request, ServerState st, ServeConfig config) → void {
     if request is map<string, value> {
         const map<string, value> tab ← request ↦ map<string, value>
-        const value vid ← tab.accipe("id")
+        const value vid ← tab.get("id")
         const string id ← vid ↦ string
-        const value via ← tab.accipe("path")
+        const value via ← tab.get("path")
         const string path ← via ↦ string
         if path ≡ "/health" {
             http_respond(id, 200, health_body(st))
@@ -1146,8 +1202,8 @@ fn handle_request(value request, ServerState st, ServeConfig config) → void {
 # accept was cancelled; log other request-level rejects (oversize body,
 # malformed request) and continue. A stopped listener ends the loop (D6).
 fn accept_loop_step(bool serving, string err) → bool {
-    const bool cancelled_hit ← err.continet("E_CANCELLED")
-    const bool stopped_hit ← err.continet("listener is stopped")
+    const bool cancelled_hit ← err.contains("E_CANCELLED")
+    const bool stopped_hit ← err.contains("listener is stopped")
     if cancelled_hit or stopped_hit {
         return false
     }
@@ -1163,14 +1219,15 @@ fn serve(ServeConfig config) → void {
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
-    fac {
-        const string sha ← model.admit(state.model_path)
+    do {
+        const string sha ← admit_model(state.model_path)
         state ← admitted(state, sha)
         stderr_write("inferentia: model admitted (sha256 " + sha + ")\n")
     }
-    cape err {
-        state ← failed(state, err)
-        stderr_write("inferentia: admission failed: " + err + "\n")
+    catch err {
+        const string cause ← gguf.message(err)
+        state ← failed(state, cause)
+        stderr_write("inferentia: admission failed: " + cause + "\n")
     }
 
     # U4 generation readiness: load the weights exactly once (the binding's
@@ -1179,8 +1236,8 @@ fn serve(ServeConfig config) → void {
     # on stderr; every /generate reuses the resident model (no reload). A
     # failed warm-up is an admission/load failure (D5 → exit 2 at shutdown).
     if state.state ≡ "ready" {
-        fac {
-            const value warmup_cfg ← GenerateConfig {
+        do {
+            const GenerateConfig warmup_cfg ← GenerateConfig {
                 contextus = model_context_limit(),
                 magna_promptus = 1,
                 maxima_verborum = 1,
@@ -1190,9 +1247,9 @@ fn serve(ServeConfig config) → void {
                 top_p = 1.0,
                 min_p = 0.0,
                 poena_repetitionis = 1.0
-            } ↦ value
-            const list<int> warmup_tokens ← model.generate(warmup_cfg, frozen_prompt_ids())
-            const int n ← warmup_tokens.longitudo()
+            }
+            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids())
+            const int n ← warmup_tokens.length()
             if n < 1 {
                 state ← failed(state, "generation readiness: warm-up produced no tokens")
                 stderr_write("inferentia: generation readiness failed: warm-up produced no tokens\n")
@@ -1200,25 +1257,26 @@ fn serve(ServeConfig config) → void {
                 stderr_write("inferentia: model loaded once (resident) — generation ready\n")
             }
         }
-        cape err {
-            state ← failed(state, "generation readiness failed: " + err)
-            stderr_write("inferentia: generation readiness failed: " + err + "\n")
+        catch err {
+            const string cause ← generatio.message(err)
+            state ← failed(state, "generation readiness failed: " + cause)
+            stderr_write("inferentia: generation readiness failed: " + cause + "\n")
         }
     }
 
     var bool serving ← true
     while serving {
-        fac {
+        do {
             const value request ← http_accept(listener)
             handle_request(request, state, config)
         }
-        cape err {
+        catch err {
             # A request-level reject (oversize body, malformed request) must
             # not end the serve loop; only a stopped/cancelled listener does.
             # The decision lives in a helper: the MIR stepper (`faber test`)
             # cannot lower a conditional inside a `cape` block that wraps a
             # local call into a host route (recorded toolchain limitation).
-            serving ← accept_loop_step(serving, err ↦ string)
+            serving ← accept_loop_step(serving, err ↦ string ⇥ "accept error")
         }
     }
 
@@ -1373,18 +1431,18 @@ describe "generate request JSON parse" tag "inferentia" {
     test "unknown field is an imperium_admissum reject row" {
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"hi\",\"bogus\":1}")
         assert not req.ok
-        assert req.error.continet("unknown field 'bogus'")
-        assert req.error.continet("imperium_admissum")
+        assert req.error.contains("unknown field 'bogus'")
+        assert req.error.contains("imperium_admissum")
     }
     test "empty prompt is rejected" {
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"\"}")
         assert not req.ok
-        assert req.error.continet("must not be empty")
+        assert req.error.contains("must not be empty")
     }
     test "missing prompt is rejected" {
         const GenerateRequest req ← json_parse_generate_body("{\"max_tokens\":4}")
         assert not req.ok
-        assert req.error.continet("missing required field 'prompt'")
+        assert req.error.contains("missing required field 'prompt'")
     }
     test "malformed JSON is rejected with a typed cause" {
         assert not (json_parse_generate_body("")).ok
@@ -1403,7 +1461,7 @@ describe "generate request JSON parse" tag "inferentia" {
     test "duplicate fields are rejected" {
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\",\"prompt\":\"b\"}")
         assert not req.ok
-        assert req.error.continet("duplicate field")
+        assert req.error.contains("duplicate field")
     }
     test "whitespace and integer-form floats are tolerated" {
         const GenerateRequest req ← json_parse_generate_body("  { \"prompt\" : \"hi\" , \"max_tokens\" : 4 , \"temperature\" : 1 }  ")
@@ -1420,7 +1478,7 @@ describe "generate request JSON parse" tag "inferentia" {
     test "unsupported unicode escape is rejected with a typed cause" {
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\\u0041\"}")
         assert not req.ok
-        assert req.error.continet("\\uXXXX escapes are not supported")
+        assert req.error.contains("\\uXXXX escapes are not supported")
     }
 }
 describe "generate config precedence" tag "inferentia" {
@@ -1453,35 +1511,35 @@ describe "generate config precedence" tag "inferentia" {
 describe "prompt encode" tag "inferentia" {
     test "frozen fixture text maps to the pinned prompt ids (BD-1 absent placeholder)" {
         # Tests the pure fallback directly: the wrapper (encode_prompt) calls
-        # the model.tokenize library route, which the MIR stepper (`faber test`)
+        # G3 tokenizator.tokenize, which the MIR stepper (`faber test`)
         # cannot execute (recorded toolchain limitation, cf. BD-3).
-        const EncodeResult enc ← encode_fallback(frozen_prompt_text(), "model:tokenize requires the BD-1 tokenizer encoder")
+        const EncodeResult enc ← encode_fallback(frozen_prompt_text(), "gradus:tokenizer tables not loaded from the admitted row")
         assert enc.ok
-        const int n ← enc.ids.longitudo()
+        const int n ← enc.ids.length()
         assert n ≡ 9
-        const int first ← enc.ids.accipe(0) coalesce 0
+        const int first ← enc.ids.get(0) coalesce 0
         assert first ≡ 504
     }
     test "any other prompt rejects with the typed cause" {
-        const EncodeResult enc ← encode_fallback("some other text", "model:tokenize requires the BD-1 tokenizer encoder (gradus BBPE text→ids), which is not implemented yet")
+        const EncodeResult enc ← encode_fallback("some other text", "gradus:tokenizer tables not loaded from the admitted row (G3 tokenize needs vocab/merge tables)")
         assert not enc.ok
-        assert enc.error.continet("prompt encode unavailable")
-        assert enc.error.continet("BD-1")
+        assert enc.error.contains("prompt encode unavailable")
+        assert enc.error.contains("gradus:tokenizer")
     }
 }
 describe "generate error classification" tag "inferentia" {
     test "gradus reject-row causes map to 400" {
-        assert classify_generate_error("model:generate config maxima_verborum must fit within contextus") ≡ 400
-        assert classify_generate_error("model:generate unknown config field \"bogus\" (imperium_admissum reject)") ≡ 400
-        assert classify_generate_error("model:generate implements only the deterministic greedy path") ≡ 400
-        assert classify_generate_error("model:generate prompt length 9000 does not fit contextus 8192") ≡ 400
-        assert classify_generate_error("model:generate context limit reached") ≡ 400
-        assert classify_generate_error("model:generate config semen must be at least one") ≡ 400
+        assert classify_generate_error("maximum generated tokens must fit within the context") ≡ 400
+        assert classify_generate_error("malformed generation config wire") ≡ 400
+        assert classify_generate_error("prompt length does not fit context") ≡ 400
+        assert classify_generate_error("needs at least one prompt token") ≡ 400
+        assert classify_generate_error("seed must be at least one") ≡ 400
+        assert classify_generate_error("temperature must be non-negative") ≡ 400
     }
     test "engine-side failures map to 500" {
-        assert classify_generate_error("model:generate prefill failed: op mismatch") ≡ 500
-        assert classify_generate_error("model:generate decode failed: layout") ≡ 500
-        assert classify_generate_error("model bridge: pinned model unavailable") ≡ 500
+        assert classify_generate_error("prefill failed: op mismatch") ≡ 500
+        assert classify_generate_error("decode failed: layout") ≡ 500
+        assert classify_generate_error("pinned model unavailable") ≡ 500
         assert classify_generate_error("") ≡ 500
     }
 }
@@ -1505,22 +1563,22 @@ describe "generate response" tag "inferentia" {
         const list<int> tokens ← [30, 198, 198]
         const list<int> prompt_ids ← [504, 2365]
         const string body ← generate_response_body(st, tokens, prompt_ids, 16)
-        assert body.continet("\"model\"")
-        assert body.continet("\"text\":\"30 198 198\"")
-        assert body.continet("\"tokens\":[30,198,198]")
-        assert body.continet("\"finish_reason\":\"eos\"")
-        assert body.continet("\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}")
+        assert body.contains("\"model\"")
+        assert body.contains("\"text\":\"30 198 198\"")
+        assert body.contains("\"tokens\":[30,198,198]")
+        assert body.contains("\"finish_reason\":\"eos\"")
+        assert body.contains("\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}")
     }
     test "error body escapes embedded quotes" {
-        const string body ← error_body("model:generate unknown config field \"bogus\"")
-        assert body ≡ "{\"error\":\"model:generate unknown config field \\\"bogus\\\"\"}"
+        const string body ← error_body("malformed generation config wire")
+        assert body ≡ "{\"error\":\"malformed generation config wire\"}"
     }
     test "eog stop set is pinned to {0,2}" {
         const list<int> eog ← eog_stop_set()
-        const int n ← eog.longitudo()
+        const int n ← eog.length()
         assert n ≡ 2
-        const int first ← eog.accipe(0) coalesce -1
-        const int second ← eog.accipe(1) coalesce -1
+        const int first ← eog.get(0) coalesce -1
+        const int second ← eog.get(1) coalesce -1
         assert (first ≡ 0) and (second ≡ 2)
     }
 }
@@ -1543,8 +1601,8 @@ describe "model endpoint" tag "inferentia" {
     }
     test "model body reflects the configured max_output_tokens" {
         const ServerState st ← admitted(new_state("/m.gguf"), "2fa3f013")
-        assert model_body(st, 16).continet("\"max_output_tokens\":16")
-        assert model_body(st, 1).continet("\"max_output_tokens\":1")
+        assert model_body(st, 16).contains("\"max_output_tokens\":16")
+        assert model_body(st, 1).contains("\"max_output_tokens\":1")
     }
     test "model unready body carries the state" {
         assert model_unready_body(new_state("/m.gguf")) ≡ "{\"state\":\"starting\"}"
@@ -1555,6 +1613,6 @@ describe "model endpoint" tag "inferentia" {
         # json_escape is applied to the sha256 (a no-op for hex, but the body
         # stays valid JSON under any future identity source).
         const ServerState st ← admitted(new_state("/m.gguf"), "a\"b")
-        assert model_body(st, 32).continet("\"sha256\":\"a\\\"b\"")
+        assert model_body(st, 32).contains("\"sha256\":\"a\\\"b\"")
     }
 }

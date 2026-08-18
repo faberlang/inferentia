@@ -3,8 +3,8 @@
 # admission-failure matrix (I1 U2 / U7)
 # =============================================================================
 #
-# This no-host harness runs the real `model:admit` route (the BD-2 execution
-# bridge over the faber-runtime pinned-row engine) on one GGUF path and mirrors
+# This no-host harness runs the admission contract (`solum:digestio` +
+# `solum:hauri` → `gradus:model/gguf` admit) on one GGUF path and mirrors
 # the D5 process exit contract:
 #
 #   exit 0 — admission succeeded; the verified whole-file SHA-256 is printed.
@@ -14,7 +14,7 @@
 # It is deliberately buildable on the installed faber toolchain: it does not
 # set `[target.rust] host = "native"`, so no native host crates are linked and
 # the faber-runtime package-collision that blocks the server binary does not
-# arise here. It never calls `model:forward` / `model:generate`, so no weight
+# arise here. It never calls generate, so no weight
 # materialization happens on this path (the U2 "no weight materialization on
 # failure" gate).
 #
@@ -28,7 +28,8 @@
 # fixtures.py and the full matrix (typed cause + exit 0/2 + listener
 # regression) is validated by run.sh in this directory.
 
-import from "model:model" private model
+import from "gradus:model/capsule" capsula
+import from "gradus:model/gguf" gguf
 
 # The pinned row's verified whole-file SHA-256 (gi0-model-contract v1.0.0 §1;
 # i1-discovery.md identity table).
@@ -49,14 +50,33 @@ fn exit_with(int code) → void {
     return call 'processus:exi' (code) ↦ void
 }
 
+fn bytes_as_u8(bytes raw) → list<int<u8>> {
+    var list<int<u8>> out ← []
+    var int i ← 0
+    while i < raw.length() {
+        out.append(raw.get(i) coalesce (0 ∷ int<u8>))
+        i ← i + 1
+    }
+    return out
+}
+
+# Path → host digest + bytes → gradus admit. Returns the carried digest.
+fn admit_model(string path) → string ⇥ gguf.GgufError {
+    const string digest ← call 'solum:digestio' (path) ↦ string
+    const bytes raw ← call 'solum:hauri' (path) ↦ bytes
+    const list<int<u8>> data ← bytes_as_u8(raw)
+    const capsula.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
+    return cap.digest()
+}
+
 main args argv {
-    if argv.longitudo() < 2 {
+    if argv.length() < 2 {
         stderr_write("usage: admission-gate <model-path>\n")
         exit_with(1)
     }
-    const string path ← argv.accipe(1) coalesce ""
-    fac {
-        const string sha ← model.admit(path)
+    const string path ← argv.get(1) coalesce ""
+    do {
+        const string sha ← admit_model(path)
         stdout_write("admitted: " + sha + "\n")
         if sha ≡ pinned_sha() {
             stdout_write("PASS admission: digest equals the pinned row (2fa3f013…)\n")
@@ -65,8 +85,8 @@ main args argv {
             exit_with(2)
         }
     }
-    cape err {
-        stdout_write("rejected: §"(err) + "\n")
+    catch err {
+        stdout_write("rejected: " + gguf.message(err) + "\n")
         exit_with(2)
     }
 }

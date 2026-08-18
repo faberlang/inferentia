@@ -2,8 +2,7 @@
 # generate-gate — executable proof of the U4 generation path (I1 U4)
 # =============================================================================
 #
-# This no-host harness drives the real `model:generate` route (the BD-2
-# execution bridge over the faber-runtime pinned-row engine) through the U4
+# This no-host harness drives G2 `gradus:generation.generate` through the U4
 # request pipeline's config surface and proves the engine-level behavior the
 # server binary builds on:
 #
@@ -17,20 +16,16 @@
 #      282,1027,28,979,260,1796]; the exact oracle match is U5's gate).
 #   3. max_tokens budget: maxima_verborum=1 → exactly 1 token; =3 → exactly
 #      [30,198,198] (the BD-2-proven prefix).
-#   4. EOG stop set {0,2}: the pinned engine's top-1 surface excludes EOG ids
-#      (faber-runtime cpu_oracle contract), so a 16-token run returns exactly
-#      16 non-EOG tokens — the budget is the binding termination (the app's
-#      finish_reason is "length" at the budget, "eos" on an early stop).
-#   5. Gradus reject rows: unknown config field, maxima_verborum < 1,
-#      maxima_verborum > contextus, non-greedy temperature, negative
-#      temperature, top_p out of [0,1], seed 0, empty prompt → typed causes
+#   4. EOG stop set {0,2}: G2 emit-and-halt on the first EOG token.
+#   5. Gradus reject rows: construct_generation / generate typed causes
 #      (fail closed, never silently ignored).
 #
 # Exit: 0 on ALL PASS, 1 on any FAIL (a script can gate on the exit code).
 # Model identity: pinned SmolLM2-360M-Instruct-Q4_K_M.gguf
 #   sha256 2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
 
-import from "model:model" private model
+import from "gradus:decode" decode
+import from "gradus:generation" generatio
 
 # --- I/O + exit ------------------------------------------------------------
 fn stdout_write(string text) → void {
@@ -87,50 +82,30 @@ fn frozen_config(int max_tokens) → GenerateConfig {
     }
 }
 
-# A config with a tenth (unknown) field — the imperium_admissum reject row.
-class BadConfig {
-    int contextus
-    int magna_promptus
-    int maxima_verborum
-    int semen
-    float temperatura
-    int top_k
-    float top_p
-    float min_p
-    float poena_repetitionis
-    int bogus
+fn to_generation(GenerateConfig cfg) → generatio.GenerationConfig ⇥ generatio.GeneratioError {
+    return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
 }
 
-fn bad_config() → BadConfig {
-    return BadConfig {
-        contextus = 8192,
-        magna_promptus = 1,
-        maxima_verborum = 4,
-        semen = 1,
-        temperatura = 0.0,
-        top_k = 0,
-        top_p = 1.0,
-        min_p = 0.0,
-        poena_repetitionis = 1.0,
-        bogus = 1
-    }
+fn run_generate(GenerateConfig cfg, list<int> prompt) → list<int> ⇥ generatio.GeneratioError {
+    const generatio.GenerationConfig g ← to_generation(cfg)
+    return generatio.generate(g, prompt, decode.default())
 }
 
 # --- Check helpers ----------------------------------------------------------
 # A generate call must REJECT with an error whose text contains `needle`.
 # The fac/cape only touch `var` locals; the params are read after both blocks
 # (the generated Rust moves captured params into the recovery block).
-fn expect_reject(value cfg, list<int> prompt, string needle) → void {
+fn expect_reject(GenerateConfig cfg, list<int> prompt, string needle) → void {
     var int unexpected_count ← -1
     var bool raised ← false
     var string raise_error ← ""
-    fac {
-        const list<int> tokens ← model.generate(cfg, prompt)
-        unexpected_count ← tokens.longitudo()
+    do {
+        const list<int> tokens ← run_generate(cfg, prompt)
+        unexpected_count ← tokens.length()
     }
-    cape err {
+    catch err {
         raised ← true
-        raise_error ← err ↦ string
+        raise_error ← generatio.message(err)
     }
     if not raised {
         fail("expected rejection containing '" + needle + "' but generate returned " + (unexpected_count ↦ string) + " tokens")
@@ -139,24 +114,42 @@ fn expect_reject(value cfg, list<int> prompt, string needle) → void {
     # needle text is consumed by the check and cannot be reused after it.
     const string pass_line ← "PASS reject: " + needle
     const string fail_line ← "rejection for '" + needle + "' got: "
-    if raise_error.continet(needle) {
+    if raise_error.contains(needle) {
         stdout_write(pass_line + "\n")
     } else {
         fail(fail_line + raise_error)
     }
 }
 
-fn expect_count(value cfg, list<int> prompt, int expected_count, string label) → void {
+fn expect_reject_wire(string wire, string needle) → void {
+    var string raise_error ← ""
+    do {
+        const generatio.GenerationConfig g ← generatio.deserialize_generation(wire)
+        fail("expected wire rejection containing '" + needle + "' but deserialize returned context " + (g.context() ↦ string))
+    }
+    catch err {
+        raise_error ← generatio.message(err)
+    }
+    const string pass_line ← "PASS reject: " + needle
+    const string fail_line ← "rejection for '" + needle + "' got: "
+    if raise_error.contains(needle) {
+        stdout_write(pass_line + "\n")
+    } else {
+        fail(fail_line + raise_error)
+    }
+}
+
+fn expect_count(GenerateConfig cfg, list<int> prompt, int expected_count, string label) → void {
     var int actual ← -1
     var bool raised ← false
     var string raise_error ← ""
-    fac {
-        const list<int> tokens ← model.generate(cfg, prompt)
-        actual ← tokens.longitudo()
+    do {
+        const list<int> tokens ← run_generate(cfg, prompt)
+        actual ← tokens.length()
     }
-    cape err {
+    catch err {
         raised ← true
-        raise_error ← err ↦ string
+        raise_error ← generatio.message(err)
     }
     if raised {
         fail(label + " raised: " + raise_error)
@@ -168,31 +161,31 @@ fn expect_count(value cfg, list<int> prompt, int expected_count, string label) �
     }
 }
 
-fn expect_sequence(value cfg, list<int> prompt, list<int> expected, string label) → void {
+fn expect_sequence(GenerateConfig cfg, list<int> prompt, list<int> expected, string label) → void {
     var list<int> actual ← []
     var bool raised ← false
     var string raise_error ← ""
-    fac {
-        const list<int> tokens ← model.generate(cfg, prompt)
+    do {
+        const list<int> tokens ← run_generate(cfg, prompt)
         actual ← tokens
     }
-    cape err {
+    catch err {
         raised ← true
-        raise_error ← err ↦ string
+        raise_error ← generatio.message(err)
     }
     if raised {
         fail(label + " raised: " + raise_error)
     }
-    const int n ← actual.longitudo()
-    const int en ← expected.longitudo()
+    const int n ← actual.length()
+    const int en ← expected.length()
     if n ≠ en {
         fail(label + " expected " + (en ↦ string) + " tokens, got " + (n ↦ string))
     }
     var int i ← 0
     var bool same ← true
     while i < n {
-        const int a ← actual.accipe(i) coalesce -1
-        const int b ← expected.accipe(i) coalesce -2
+        const int a ← actual.get(i) coalesce -1
+        const int b ← expected.get(i) coalesce -2
         if a ≠ b {
             same ← false
         }
@@ -219,8 +212,8 @@ fn expect_sequence(value cfg, list<int> prompt, list<int> expected, string label
 fn print_int_list(string label, list<int> ids) → void {
     stdout_write(label + ": [")
     var int i ← 0
-    while i < ids.longitudo() {
-        const int t ← ids.accipe(i) coalesce 0
+    while i < ids.length() {
+        const int t ← ids.get(i) coalesce 0
         if i > 0 {
             stdout_write(",")
         }
@@ -236,15 +229,15 @@ fn expect_p10_tokenization() → void {
     # the same array — recorded in the validation log).
     const list<int> record_prompt_tokens ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
     const list<int> p10 ← pinned_prompt()
-    const int n ← p10.longitudo()
-    if n ≠ record_prompt_tokens.longitudo() {
+    const int n ← p10.length()
+    if n ≠ record_prompt_tokens.length() {
         fail("U5 tokenization: P10 length mismatch")
     }
     var bool same ← true
     var int i ← 0
     while i < n {
-        const int a ← p10.accipe(i) coalesce -1
-        const int b ← record_prompt_tokens.accipe(i) coalesce -2
+        const int a ← p10.get(i) coalesce -1
+        const int b ← record_prompt_tokens.get(i) coalesce -2
         if a ≠ b {
             same ← false
         }
@@ -277,18 +270,18 @@ main args argv {
 
     # Warm-up: one token proves the engine can decode (mirrors the server's
     # generation-readiness step).
-    expect_count(frozen_config(1) ↦ value, pinned_prompt(), 1, "warm-up generate (max_tokens 1)")
+    expect_count(frozen_config(1), pinned_prompt(), 1, "warm-up generate (max_tokens 1)")
 
     # Request 1 — the frozen fixture: ≥ 16 tokens, no EOG id admitted.
     var list<int> r1 ← []
-    fac {
-        const list<int> tokens ← model.generate(frozen_config(16) ↦ value, pinned_prompt())
+    do {
+        const list<int> tokens ← run_generate(frozen_config(16), pinned_prompt())
         r1 ← tokens
     }
-    cape err {
-        fail("request1 raised: " + (err ↦ string))
+    catch err {
+        fail("request1 raised: " + generatio.message(err))
     }
-    const int n1 ← r1.longitudo()
+    const int n1 ← r1.length()
     stdout_write("request1: " + (n1 ↦ string) + " tokens\n")
     if n1 < 16 {
         fail("request1 produced fewer than 16 tokens")
@@ -296,7 +289,7 @@ main args argv {
     stdout_write("request1 tokens: [")
     var int i ← 0
     while i < n1 {
-        const int t ← r1.accipe(i) coalesce 0
+        const int t ← r1.get(i) coalesce 0
         if i > 0 {
             stdout_write(",")
         }
@@ -307,7 +300,7 @@ main args argv {
     var bool no_eog ← true
     var int j ← 0
     while j < n1 {
-        const int t ← r1.accipe(j) coalesce 0
+        const int t ← r1.get(j) coalesce 0
         if (t ≡ 0) or (t ≡ 2) {
             no_eog ← false
         }
@@ -320,17 +313,17 @@ main args argv {
     }
 
     # Request 2 — sequential, resident model: identical greedy output.
-    fac {
-        const list<int> r2 ← model.generate(frozen_config(16) ↦ value, pinned_prompt())
-        const int n2 ← r2.longitudo()
+    do {
+        const list<int> r2 ← run_generate(frozen_config(16), pinned_prompt())
+        const int n2 ← r2.length()
         if n2 ≠ n1 {
             fail("request2 token count differs from request1 (reload suspected)")
         }
         var bool same ← true
         var int k ← 0
         while k < n1 {
-            const int a ← r1.accipe(k) coalesce -1
-            const int b ← r2.accipe(k) coalesce -2
+            const int a ← r1.get(k) coalesce -1
+            const int b ← r2.get(k) coalesce -2
             if a ≠ b {
                 same ← false
             }
@@ -342,25 +335,24 @@ main args argv {
             fail("request2 tokens differ from request1 (resident-model violation)")
         }
     }
-    cape err {
-        fail("request2 raised: " + (err ↦ string))
+    catch err {
+        fail("request2 raised: " + generatio.message(err))
     }
 
     # max_tokens budget: the frozen continuation hits no EOG within the record
     # window, so the budget binds and the run returns exactly max_tokens.
-    expect_count(frozen_config(1) ↦ value, pinned_prompt(), 1, "max_tokens budget: 1")
-    expect_sequence(frozen_config(3) ↦ value, pinned_prompt(), [30, 198, 198], "max_tokens budget: 3 == [30,198,198] (BD-2 prefix)")
-    expect_sequence(frozen_config(16) ↦ value, pinned_prompt(), record_prefix_16(), "max_tokens budget: 16 == record.json prefix")
+    expect_count(frozen_config(1), pinned_prompt(), 1, "max_tokens budget: 1")
+    expect_sequence(frozen_config(3), pinned_prompt(), [30, 198, 198], "max_tokens budget: 3 == [30,198,198] (BD-2 prefix)")
+    expect_sequence(frozen_config(16), pinned_prompt(), record_prefix_16(), "max_tokens budget: 16 == record.json prefix")
 
-    # Gradus reject rows (imperium_admissum — typed causes, fail closed).
-    expect_reject(bad_config() ↦ value, pinned_prompt(), "unknown config field")
-    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 0, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "maxima_verborum must be at least one")
-    expect_reject(GenerateConfig { contextus = 8, magna_promptus = 1, maxima_verborum = 16, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "maxima_verborum must fit within contextus")
-    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = 0.5, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "deterministic greedy path")
-    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = -1.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "temperatura must be non-negative")
-    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = 0.0, top_k = 0, top_p = 2.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "top_p must be within [0, 1]")
-    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 0, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 } ↦ value, pinned_prompt(), "semen must be at least one")
-    expect_reject(frozen_config(4) ↦ value, [], "needs at least one prompt token")
+    # Gradus reject rows (construct_generation / generate — typed causes, fail closed).
+    expect_reject_wire("generation/config/1.0.0/8192/1/4/1/0/0/1/0/1/bogus", "malformed")
+    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 0, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "maximum generated tokens must be at least one")
+    expect_reject(GenerateConfig { contextus = 8, magna_promptus = 1, maxima_verborum = 16, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "maximum generated tokens must fit within the context")
+    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = -1.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "temperature must be non-negative")
+    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = 0.0, top_k = 0, top_p = 2.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "top-p must be within [0, 1]")
+    expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 0, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "seed must be at least one")
+    expect_reject(frozen_config(4), [], "needs at least one prompt token")
 
     stdout_write("GENERATE GATE ALL PASS\n")
 }

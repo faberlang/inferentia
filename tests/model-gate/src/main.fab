@@ -3,8 +3,8 @@
 # =============================================================================
 #
 # This no-host harness mirrors the U3 `/model` endpoint contract. It drives
-# the real `model:admit` route (the BD-2 execution bridge over the
-# faber-runtime pinned-row engine) and verifies the identity facts the
+# the admission contract (`solum:digestio` + `solum:hauri` →
+# `gradus:model/gguf` admit) and verifies the identity facts the
 # `/model` body carries:
 #
 #   1. ADMISSION: admit returns the pinned row's whole-file SHA-256
@@ -32,7 +32,8 @@
 #   size 270,590,880 bytes, sha256
 #   2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
 
-import from "model:model" private model
+import from "gradus:model/capsule" capsula
+import from "gradus:model/gguf" gguf
 
 # --- I/O + exit ------------------------------------------------------------
 fn stdout_write(string text) → void {
@@ -50,6 +51,25 @@ fn exit_with(int code) → void {
 fn fail(string why) → void {
     stdout_write("FAIL " + why + "\n")
     exit_with(1)
+}
+
+fn bytes_as_u8(bytes raw) → list<int<u8>> {
+    var list<int<u8>> out ← []
+    var int i ← 0
+    while i < raw.length() {
+        out.append(raw.get(i) coalesce (0 ∷ int<u8>))
+        i ← i + 1
+    }
+    return out
+}
+
+# Path → host digest + bytes → gradus admit. Returns the carried digest.
+fn admit_model(string path) → string ⇥ gguf.GgufError {
+    const string digest ← call 'solum:digestio' (path) ↦ string
+    const bytes raw ← call 'solum:hauri' (path) ↦ bytes
+    const list<int<u8>> data ← bytes_as_u8(raw)
+    const capsula.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
+    return cap.digest()
 }
 
 # --- Pinned facts (i1-discovery §2.1 identity table) -----------------------
@@ -110,23 +130,23 @@ fn assemble_model_body(string sha, int max_output_tokens) → string {
 # --- Main -------------------------------------------------------------------
 main args argv {
     stdout_write("model-gate: I1 U3 /model identity proof\n")
-    if argv.longitudo() < 2 {
+    if argv.length() < 2 {
         stderr_write("usage: model-gate <model-path>\n")
         exit_with(1)
     }
-    const string path ← argv.accipe(1) coalesce ""
+    const string path ← argv.get(1) coalesce ""
 
     # 1. Admission: the real BD-2 route returns the pinned row's SHA-256.
     var string sha ← ""
     var bool raised ← false
     var string raise_error ← ""
-    fac {
-        const string s ← model.admit(path)
+    do {
+        const string s ← admit_model(path)
         sha ← s
     }
-    cape err {
+    catch err {
         raised ← true
-        raise_error ← err ↦ string
+        raise_error ← gguf.message(err)
     }
     if raised {
         fail("admit raised: " + raise_error)
