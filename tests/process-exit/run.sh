@@ -24,7 +24,7 @@
 # Until those land, the product-binary assertions report the ACTUAL statuses
 # as evidence (expected 0/2, observed 143) and exit 1.
 #
-# The admission path itself (real `model:admit` on the pinned row) is proven
+# The admission path itself (real `gradus:model/gguf` admit on the pinned row) is proven
 # end-to-end by the admission-gate harness under tests/admission-gate/.
 #
 # Usage: ./run.sh [MODEL_PATH]

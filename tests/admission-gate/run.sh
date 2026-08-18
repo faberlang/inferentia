@@ -3,8 +3,8 @@
 # run.sh — I1 U7 admission-failure matrix + listener behavior regression
 # =============================================================================
 #
-# Drives the admission-gate harness (the real `model:admit` BD-2 bridge over
-# the faber-runtime pinned-row engine) across the five-failure fixture matrix
+# Drives the admission-gate harness (`solum:digestio` + `solum:hauri` →
+# `gradus:model/gguf` admit) across the five-failure fixture matrix
 # and asserts the D5 process exit contract for the harness paths:
 #
 #   exit 0 — admission succeeded; the verified whole-file SHA-256 is printed.
@@ -21,7 +21,7 @@
 #   unknown-key      -> unknown metadata key           (UnknownMetadataKey)
 #
 # No weight materialization is possible on this path: the harness only ever
-# calls `model:admit` (never `model:forward` / `model:generate`), so each
+# calls `gguf.admit` (never generate), so each
 # fixture rejection happens before any allocation proportional to the row.
 #
 # The listener regression then starts the PRODUCT binary on the malformed
@@ -80,7 +80,7 @@ while IFS=$'\t' read -r FIXTURE EXPECTED; do
     STATUS=$?
     NAME="$(basename "$FIXTURE" .gguf)"
     if [ "$STATUS" -eq 2 ] && printf '%s\n' "$OUT" | grep -qF "$EXPECTED" \
-        && printf '%s\n' "$OUT" | grep -qF "model:admit failed:"; then
+        && printf '%s\n' "$OUT" | grep -qF "rejected:"; then
         ok "$NAME -> exit 2 + typed cause ('$EXPECTED')"
     else
         bad "$NAME expected exit 2 + '$EXPECTED', observed status $STATUS: $OUT"

@@ -1887,9 +1887,9 @@ describe "health lifecycle" tag "inferentia" {
         assert st.model_path ≡ "/models/x.gguf"
     }
     test "admission failure transitions to failed with typed error" {
-        const ServerState st ← failed(new_state("/missing.gguf"), "model:admit failed: io error: No such file")
+        const ServerState st ← failed(new_state("/missing.gguf"), "io error: No such file")
         assert st.state ≡ "failed"
-        assert st.error_text ≡ "model:admit failed: io error: No such file"
+        assert st.error_text ≡ "io error: No such file"
     }
     test "health body starting" {
         const ServerState st ← new_state("/models/x.gguf")

@@ -43,7 +43,7 @@ scoped in the u2p1 closeout:
    signal (observed `$?` = 143) and the loop-end path is unreachable.
 
 Until both land, `run.sh` reports the observed statuses as evidence and
-exits 1. The **admission path itself** (real `model:admit` on the pinned
+exits 1. The **admission path itself** (real `gradus:model/gguf` admit on the pinned
 row → exit 0 / exit 2) is proven end-to-end by the harness under
 `tests/admission-gate/`.
 

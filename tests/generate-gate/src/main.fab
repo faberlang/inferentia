@@ -312,7 +312,7 @@ main args argv {
         fail("request1 returned an EOG id (the pinned top-1 excludes EOG)")
     }
 
-    # Request 2 — sequential, resident model: identical greedy output.
+    # Request 2 — sequential, resident model — identical greedy output.
     do {
         const list<int> r2 ← run_generate(frozen_config(16), pinned_prompt())
         const int n2 ← r2.length()
