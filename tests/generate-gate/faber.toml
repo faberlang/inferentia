@@ -12,7 +12,7 @@ target = "rust"
 kind = "bin"
 
 [dependencies]
-model = "0.1.0"
+gradus = "0.1.0"
 
 [locale]
 locale = "en"
