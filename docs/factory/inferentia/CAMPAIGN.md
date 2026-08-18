@@ -1,6 +1,6 @@
 # Inferentia Master Campaign
 
-**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U4/U5 + D5-exit fix landed; BD-2 + native-dispatch fix landed in faber-runtime; remaining Slice-1 = U3/U6/U7/U8; BD-1 open (owner decision pending), BD-3 deferred, BD-4 open (Slice 2 blocked); U3+U7 in flight
+**Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U3/U4/U5/U7 + D5-exit fix landed (U3 `d1c2a8f` + U7 `6c7082b` merged 2026-08-11); remaining Slice-1 = U6/U8; BD-1 open (owner decision pending), BD-3 deferred, BD-4 open (Slice 2 blocked); build blocked — `faber.lock` still pins deleted `../faber-runtime/model` (no live successor; `faber check` PKG001 exit 1)
 
 ## Summary
 
@@ -83,10 +83,12 @@ Completion gate:
 
 ## I1 — Small GGUF vertical slice
 
-**State**: delivery specification ready — [`i1-delivery.md`](i1-delivery.md) +
-[`i1-discovery.md`](i1-discovery.md) (planned, 2026-08-09); implementation
-blocked on named prerequisite deliveries (BD-1 tokenizer runtime, BD-2
-execution bridge, BD-3 library execution, BD-4 Qwen row contract)
+**State**: Slice-1 product units U1–U5/U7 landed on `main` (U3/U7 2026-08-11);
+`faber check .` is red (PKG001) because `faber.lock` pins deleted
+`../faber-runtime/model` and that library-provider has no live successor.
+Remaining Slice-1 = U6/U8. Still blocked on BD-1 (tokenizer runtime), BD-3
+(library execution, deferred), BD-4 (Qwen row contract). BD-2's engine +
+`model:*` bindings died with the 2026-08-12 `faber-runtime` repo deletion.
 
 ### Goal
 
