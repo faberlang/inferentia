@@ -1,0 +1,584 @@
++++
+locale = "en"
++++
+# Inferentia I-live — first live run on the gradus provider.
+#
+# Admit the pinned SmolLM2 GGUF via manifestum.inspect (the generate_dense
+# admission surface), load G3 tokenizer tables with tokenizator.build,
+# tokenize the frozen prompt, materialize dense weights, and call
+# generatio.generate_dense for 16 tokens against the U5 golden.
+#
+# generate_dense applies EOG-stop {0, 2}. G2's own oracle is [30, 2].
+# The inferentia U5 golden is the 16-token llama.cpp / record.json prefix.
+
+import from "gradus:attention" attention
+import from "gradus:cache" kv
+import from "gradus:decode" decode
+import from "gradus:generation" generatio
+import from "gradus:model/artifact" artifact
+import from "gradus:model/dense" dense
+import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/tensor_payload" tensor_payload
+import from "gradus:model/tensor_view" tensor_view
+import from "gradus:tensor" tensor
+import from "gradus:tokenizer" tokenizator
+import from "norma:processus" processus
+import from "norma:solum" solum
+
+const string PINNED_PATH ← "/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf"
+const string PINNED_DIGEST ← "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+const int PINNED_BYTES ← 270590880
+const int PINNED_DATA ← 1787040
+const list<int> PINNED_TOKENS ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+const int GOLDEN_TOP1 ← 30
+const list<int> GOLDEN_16 ← [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
+const int VOCAB ← 49152
+const int SLICE_CAP ← 16777216
+const int GENERATE ← 16
+const int EOG_SMOLLM2 ← 2
+
+union DecodeRunError {
+    ArgumentaMala { string message }
+    ManifestumMala { string message }
+    AdapterMala { string message }
+    VinculumMala { string message }
+    SlicemMala { string message }
+    ForwardMala { string message }
+}
+
+fn message(DecodeRunError e) → string {
+    match e {
+        case ArgumentaMala const message { return message }
+        case ManifestumMala const message { return message }
+        case AdapterMala const message { return message }
+        case VinculumMala const message { return message }
+        case SlicemMala const message { return message }
+        case ForwardMala const message { return message }
+    }
+}
+
+fn _range(string via, int total, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "range request exceeds the artifact"
+        }
+    }
+    const bytes bytes ← solum.read_range(via, initium, longitudo)
+    if bytes.length() ≠ longitudo {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "short range read"
+        }
+    }
+    return manifestum.SourceRead {successus = true, bytes = bytes, message = ""}
+}
+
+fn _prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "inspection attempted to read the tensor data region"
+        }
+    }
+    const list<int> segmentum ← prefix.slice(initium, initium + longitudo)
+    const bytes bytes ← segmentum ↦ bytes
+    return manifestum.SourceRead {successus = true, bytes = bytes, message = ""}
+}
+
+fn _ends(string s, string tail) → bool {
+    if tail.length() ≻ s.length() then return false
+    return s.slice(s.length() - tail.length(), s.length()) ≡ tail
+}
+
+fn _slot(string nomen) → int {
+    if _ends(nomen, ".input_layernorm") then return 0
+    if _ends(nomen, ".self_attn.q_proj") then return 1
+    if _ends(nomen, ".self_attn.k_proj") then return 2
+    if _ends(nomen, ".self_attn.v_proj") then return 3
+    if _ends(nomen, ".self_attn.o_proj") then return 4
+    if _ends(nomen, ".post_attention_layernorm") then return 5
+    if _ends(nomen, ".mlp.gate_proj") then return 6
+    if _ends(nomen, ".mlp.up_proj") then return 7
+    if _ends(nomen, ".mlp.down_proj") then return 8
+    return -1
+}
+
+fn _ids_text(list<int> ids) → string {
+    var string out ← "["
+    var int i ← 0
+    while i ≺ ids.length() {
+        if i ≻ 0 {
+            out ← out + ", "
+        }
+        out ← out + ((ids.get(i) coalesce 0) ↦ string)
+        i ← i + 1
+    }
+    return out + "]"
+}
+
+fn _block_elements(tensor_view.TensorView v) → int {
+    match v.layout {
+        case manifestum.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+            return elementa_per_blockum
+        }
+        case manifestum.Ignota const typo {
+            return 0
+        }
+    }
+}
+
+fn _window(int remaining, int block) → int {
+    if remaining ≤ SLICE_CAP then return remaining
+    const int aligned ← (SLICE_CAP / block) * block
+    if aligned ≺ block then return block
+    return aligned
+}
+
+fn _limits(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ DecodeRunError {
+    do {
+        return manifestum.limes_payloadis(m, gguf_name)
+    }
+    catch err {
+        throw variant ManifestumMala {message = "payload range failed for " + gguf_name + ": " + manifestum.message(err)}
+    }
+}
+
+fn _bind(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ DecodeRunError {
+    do {
+        return tensor_view.links(m, p)
+    }
+    catch err {
+        throw variant VinculumMala {message = "view bind failed for " + p.name + ": " + tensor_view.message(err)}
+    }
+}
+
+fn _slice(
+    tensor_view.TensorView v,
+    int off,
+    int n,
+    (int, int) → manifestum.SourceRead fons
+) → list<f32> ⇥ DecodeRunError {
+    do {
+        return tensor_view.materialize_slice(v, off, n, fons)
+    }
+    catch err {
+        throw variant SlicemMala {message = "window materialize failed for " + v.name + ": " + tensor_view.message(err)}
+    }
+}
+
+fn _tensor(list<f32> datos, list<int> forma) → tensor.Tensor ⇥ DecodeRunError {
+    do {
+        return tensor.construct(datos, forma)
+    }
+    catch err {
+        throw variant SlicemMala {message = "tensor construct failed: " + tensor.message(err)}
+    }
+}
+
+fn _materialize(
+    string via,
+    int total,
+    manifestum.GgufManifest m,
+    string gguf_name
+) → tensor.Tensor ⇥ DecodeRunError {
+    const tuple<int, int> limes ← _limits(m, gguf_name)
+    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+        name = gguf_name,
+        absolute_start = limes[0],
+        length = limes[1],
+        bytes = ||
+    }
+    const tensor_view.TensorView v ← _bind(m, p)
+    const int block ← _block_elements(v)
+    if block ≺ 1 {
+        throw variant SlicemMala {message = "tensor layout has no block size: " + gguf_name}
+    }
+    var list<f32> datos ← vacua
+    var int off ← 0
+    while off ≺ v.elements {
+        const int n ← _window(v.elements - off, block)
+        const list<f32> part ← _slice(
+            v,
+            off,
+            n,
+            (int initium, int longitudo) → manifestum.SourceRead ∴ _range(via, total, initium, longitudo)
+        )
+        for from part const x {
+            datos.append(x)
+        }
+        off ← off + n
+    }
+    return _tensor(datos, v.shape)
+}
+
+fn _gguf_name(string family, int stratum) → string ⇥ DecodeRunError {
+    if family ≡ "model.embed_tokens" then return "token_embd.weight"
+    if family ≡ "model.norm" then return "output_norm.weight"
+    if family ≡ "lm_head" then return "token_embd.weight"
+    if stratum ≺ 0 or stratum ≥ 32 {
+        throw variant AdapterMala {message = "layer index outside the frozen llama layer range: " + (stratum ↦ string)}
+    }
+    if family ≡ "model.layers.input_layernorm" then return ("blk." + (stratum ↦ string)) + ".attn_norm.weight"
+    if family ≡ "model.layers.self_attn.q_proj" then return ("blk." + (stratum ↦ string)) + ".attn_q.weight"
+    if family ≡ "model.layers.self_attn.k_proj" then return ("blk." + (stratum ↦ string)) + ".attn_k.weight"
+    if family ≡ "model.layers.self_attn.v_proj" then return ("blk." + (stratum ↦ string)) + ".attn_v.weight"
+    if family ≡ "model.layers.self_attn.o_proj" then return ("blk." + (stratum ↦ string)) + ".attn_output.weight"
+    if family ≡ "model.layers.post_attention_layernorm" then return ("blk." + (stratum ↦ string)) + ".ffn_norm.weight"
+    if family ≡ "model.layers.mlp.gate_proj" then return ("blk." + (stratum ↦ string)) + ".ffn_gate.weight"
+    if family ≡ "model.layers.mlp.up_proj" then return ("blk." + (stratum ↦ string)) + ".ffn_up.weight"
+    if family ≡ "model.layers.mlp.down_proj" then return ("blk." + (stratum ↦ string)) + ".ffn_down.weight"
+    throw variant AdapterMala {message = "unknown canonical tensor name: " + family}
+}
+
+fn _kmajor_to_linear(tensor.Tensor t) → tensor.Tensor ⇥ DecodeRunError {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        throw variant AdapterMala {message = "linear weight must be rank 2"}
+    }
+    const int k ← f.get(0) coalesce 1
+    const int n ← f.get(1) coalesce 1
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ k {
+        var int j ← 0
+        while j ≺ n {
+            out.append(t.data.get(j * k + i) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    return _tensor(out, [k, n])
+}
+
+fn _linear_family(string family) → bool {
+    if family ≡ "lm_head" then return true
+    if _ends(family, ".self_attn.q_proj") then return true
+    if _ends(family, ".self_attn.k_proj") then return true
+    if _ends(family, ".self_attn.v_proj") then return true
+    if _ends(family, ".self_attn.o_proj") then return true
+    if _ends(family, ".mlp.gate_proj") then return true
+    if _ends(family, ".mlp.up_proj") then return true
+    if _ends(family, ".mlp.down_proj") then return true
+    return false
+}
+
+fn _load_one(
+    string via,
+    int total,
+    manifestum.GgufManifest m,
+    string family,
+    int stratum
+) → tensor.Tensor ⇥ DecodeRunError {
+    const string gguf_name ← _gguf_name(family, stratum)
+    const tensor.Tensor stored ← _materialize(via, total, m, gguf_name)
+    if _linear_family(family) {
+        return _kmajor_to_linear(stored)
+    }
+    return stored
+}
+
+fn _lookup(
+    string nomen,
+    int stratum,
+    tensor.Tensor embed,
+    tensor.Tensor norm_s,
+    list<list<tensor.Tensor>> strata
+) → dense.Lookup {
+    if nomen ≡ "model.embed_tokens" then return dense.Lookup {successus = true, tensorem = embed, message = ""}
+    if nomen ≡ "model.norm" then return dense.Lookup {successus = true, tensorem = norm_s, message = ""}
+    if stratum ≺ 0 or stratum ≥ strata.length() {
+        return dense.Lookup {successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string)}
+    }
+    const int slot ← _slot(nomen)
+    if slot ≺ 0 {
+        return dense.Lookup {successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen}
+    }
+    var list<tensor.Tensor> missing ← vacua
+    const list<tensor.Tensor> row ← strata.get(stratum) coalesce missing
+    if slot ≥ row.length() {
+        return dense.Lookup {successus = false, tensorem = embed, message = "layer slot missing: " + nomen}
+    }
+    const tensor.Tensor t ← row.get(slot) coalesce embed
+    return dense.Lookup {successus = true, tensorem = t, message = ""}
+}
+
+fn _indices(int n) → list<int> {
+    var list<int> out ← vacua
+    var int i ← 0
+    while i ≺ n {
+        out.append(i)
+        i ← i + 1
+    }
+    return out
+}
+
+fn _build_tokenizer(manifestum.GgufManifest m) → tokenizator.Tokenizer {
+    do {
+        return tokenizator.build(m)
+    }
+    catch err {
+        panic "G3 tokenizer tables failed: " + tokenizator.message(err)
+    }
+}
+
+fn _tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
+    do {
+        return tokenizator.tokenize(tok, prompt)
+    }
+    catch err {
+        panic "G3 tokenize failed: " + tokenizator.message(err)
+    }
+}
+
+fn _min(int a, int b) → int {
+    if a ≺ b { return a }
+    return b
+}
+
+fn _first_divergence(list<int> observed, list<int> golden) → string {
+    var int i ← 0
+    const int n ← observed.length()
+    const int g ← golden.length()
+    const int lim ← _min(n, g)
+    while i ≺ lim {
+        const int a ← observed.get(i) coalesce (0 - 1)
+        const int b ← golden.get(i) coalesce (0 - 2)
+        if a ≠ b {
+            return ((("index " + (i ↦ string)) + ": observed ") + (a ↦ string)) + " vs golden " + (b ↦ string)
+        }
+        i ← i + 1
+    }
+    if n ≠ g {
+        return (("length " + (n ↦ string)) + " vs golden ") + (g ↦ string)
+    }
+    return "none"
+}
+
+fn _match_count(list<int> observed, list<int> golden) → int {
+    var int matches ← 0
+    var int i ← 0
+    const int n ← observed.length()
+    const int g ← golden.length()
+    const int lim ← _min(n, g)
+    while i ≺ lim {
+        const int a ← observed.get(i) coalesce (0 - 1)
+        const int b ← golden.get(i) coalesce (0 - 2)
+        if a ≡ b {
+            matches ← matches + 1
+        }
+        i ← i + 1
+    }
+    return matches
+}
+
+main {
+    const list<string> args ← processus.argv() ↦ list<string>
+    var string via ← PINNED_PATH
+    var int data_expectata ← PINNED_DATA
+    var string digestio ← PINNED_DIGEST
+    if args.length() ≥ 3 {
+        via ← args.get(0) coalesce PINNED_PATH
+        do {
+            data_expectata ← (args.get(1) coalesce "0") ↦ int
+            digestio ← args.get(2) coalesce PINNED_DIGEST
+        }
+        catch err {
+            panic "usage: dense-decode-smollm2 <path> <data-offset> <sha256>"
+        }
+    }
+
+    print "policy: inferentia I-live — admit + G3 tokenizer + generate_dense"
+    print "oracle: U5 golden 16 = [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]"
+    print "g2_eog: generate_dense EOG-stop {0, 2} yields [30, 2] on this row (G1 unrestrained was [30, 2, 198])"
+    print "engine: compiled rust"
+    print "model.path=" + via
+
+    const int total ← solum.byte_length(via)
+    print "model.bytes=" + (total ↦ string)
+    if total ≠ PINNED_BYTES {
+        panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (PINNED_BYTES ↦ string)
+    }
+
+    const bytes prefix_bytes ← solum.read_range(via, 0, data_expectata)
+    if prefix_bytes.length() ≠ data_expectata {
+        panic "file adapter returned a short table-prefix read"
+    }
+    const value prefix_valor ← prefix_bytes ↦ value
+    const list<int> prefix ← prefix_valor ↦ list<int>
+    const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
+        algorithm = "sha-256",
+        digest = digestio,
+        length = total
+    }
+
+    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
+        identitas = identitas,
+        version = 0,
+        concordatio = 0,
+        data_inceptum = 0,
+        artifact_length = 0,
+        metadata = vacua,
+        tensors = vacua
+    }
+    do {
+        admitted ← manifestum.inspect(
+            (int initium, int longitudo) → manifestum.SourceRead ∴ _prefix_range(prefix, initium, longitudo),
+            total,
+            identitas
+        )
+    }
+    catch err {
+        panic "manifest admission failed: " + manifestum.message(err)
+    }
+    print "admit.digest=" + digestio
+    print "manifest.data_offset=" + (admitted.data_inceptum ↦ string)
+
+    const tokenizator.Tokenizer tok ← _build_tokenizer(admitted)
+    print "tokenizer.vocab=" + (tok.multitudo ↦ string)
+
+    const list<int> prompt_ids ← _tokenize(tok, "The quick brown fox jumps over the lazy dog")
+    print "prompt.ids=" + _ids_text(prompt_ids)
+    print "prompt.p10=" + _ids_text(PINNED_TOKENS)
+    if _first_divergence(prompt_ids, PINNED_TOKENS) ≠ "none" {
+        panic "G3 tokenize diverged from pinned P10: " + _first_divergence(prompt_ids, PINNED_TOKENS)
+    }
+
+    var tensor.Tensor embed ← tensor.default()
+    var tensor.Tensor norm_s ← tensor.default()
+    do {
+        embed ← _load_one(via, total, admitted, "model.embed_tokens", 0)
+        norm_s ← _load_one(via, total, admitted, "model.norm", 0)
+    }
+    catch err {
+        panic "embed/norm load failed: " + message(err)
+    }
+
+    const list<string> families ← [
+        "model.layers.input_layernorm",
+        "model.layers.self_attn.q_proj",
+        "model.layers.self_attn.k_proj",
+        "model.layers.self_attn.v_proj",
+        "model.layers.self_attn.o_proj",
+        "model.layers.post_attention_layernorm",
+        "model.layers.mlp.gate_proj",
+        "model.layers.mlp.up_proj",
+        "model.layers.mlp.down_proj"
+    ]
+    var list<list<tensor.Tensor>> strata ← vacua
+    var int stratum ← 0
+    while stratum ≺ 32 {
+        var list<tensor.Tensor> row ← vacua
+        var int f ← 0
+        while f ≺ families.length() {
+            do {
+                row.append(_load_one(via, total, admitted, families.get(f) coalesce "", stratum))
+            }
+            catch err {
+                panic ("layer " + (stratum ↦ string)) + " " + message(err)
+            }
+            f ← f + 1
+        }
+        strata.append(row)
+        print "loaded layer " + (stratum ↦ string)
+        stratum ← stratum + 1
+    }
+
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+    }
+    catch err {
+        panic "rope config failed: " + attention.message(err)
+    }
+
+    const dense.DenseConfig cfg ← dense.DenseConfig {
+        layers = 32,
+        heads = 15,
+        kv_heads = 5,
+        head_dim = 64,
+        hidden_dim = 960,
+        vocab = VOCAB,
+        tied = true
+    }
+
+    var kv.KVStructure structure ← kv.default_kv_structure()
+    do {
+        const kv.LayerSet set ← kv.construct_layer_set(_indices(32), kv.dense_structure(), 5, 64)
+        var list<kv.LayerSet> sets ← vacua
+        sets.append(set)
+        structure ← kv.construct_kv_structure(
+            sets,
+            kv.kv_dtype_f32(),
+            kv.kv_dtype_f32(),
+            kv.v_layout_transposed(),
+            kv.sharing_gqa(),
+            kv.attention_classic(),
+            15,
+            8192,
+            8192
+        )
+    }
+    catch err {
+        panic "kv structure failed: " + kv.message(err)
+    }
+
+    var list<kv.KVCache> layers ← vacua
+    do {
+        layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
+    }
+    catch err {
+        panic "empty caches failed: " + dense.message(err)
+    }
+    print "cache layers=" + (layers.length() ↦ string) + " dim=" + (((layers.get(0) coalesce kv.default()).dimension()) ↦ string)
+
+    var generatio.GenerationConfig gen ← generatio.default()
+    do {
+        gen ← generatio.construct_generation(8192, 1, GENERATE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+    }
+    catch err {
+        panic "generation config failed: " + generatio.message(err)
+    }
+    const generatio.DenseEngine engine ← generatio.construct_dense_engine(cfg, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+
+    var list<int> generated ← vacua
+    do {
+        generated ← generatio.generate_dense(
+            gen,
+            prompt_ids,
+            engine,
+            (string n, int s) → dense.Lookup ∴ _lookup(n, s, embed, norm_s, strata),
+            layers,
+            decode.fresh_cancellation()
+        )
+    }
+    catch err {
+        panic "generate_dense failed: " + generatio.message(err)
+    }
+
+    const int first ← generated.get(0) coalesce (0 - 1)
+    const int last_tok ← generated.get(generated.length() - 1) coalesce (0 - 1)
+    const string divergence ← _first_divergence(generated, GOLDEN_16)
+    const int matches ← _match_count(generated, GOLDEN_16)
+    print "first_sampled=" + (first ↦ string)
+    print "golden_top1=" + (GOLDEN_TOP1 ↦ string)
+    print "first_matches=" + ((first ≡ GOLDEN_TOP1) ↦ string)
+    print "observed=" + _ids_text(generated)
+    print "golden=" + _ids_text(GOLDEN_16)
+    print "observed.n=" + (generated.length() ↦ string)
+    print "token_match_count=" + (matches ↦ string)
+    print "eog_token=" + (EOG_SMOLLM2 ↦ string)
+    print "eog_stop=" + ((generated.length() ≺ GENERATE and tokenizator.est_eog(last_tok)) ↦ string)
+    print "g2_eog_oracle=[30, 2]"
+    print "g1_unrestrained=[30, 2, 198]"
+    print "first_divergence=" + divergence
+    if divergence ≡ "none" {
+        print "LIVE: PASS"
+    }
+    else {
+        print "LIVE: FAIL"
+    }
+}

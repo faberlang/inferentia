@@ -27,6 +27,11 @@
 # `gradus:generation.generate` (G2); this unit owns the request pipeline
 # around it.
 #
+# I-live: `inferentia live --model <PATH>` admits the GGUF through
+# `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
+# materializes the SmolLM2 dense weights, and calls
+# `generatio.generate_dense` for 16 tokens against the U5 golden.
+#
 # The hosts `http` provider is loopback-only HTTP/1.1, one request at a time,
 # no streaming. The `norma:http` server wrappers are not yet wired into the
 # Rust backend, so the provider routes are called directly here.
@@ -35,10 +40,18 @@
 # cannot carry the D5 usage-error exit, so argv is parsed in this unit and
 # every usage error is detected before the listener binds.
 
+import from "gradus:attention" attention
+import from "gradus:cache" kv
 import from "gradus:decode" decode
 import from "gradus:generation" generatio
+import from "gradus:model/artifact" artifact
 import from "gradus:model/capsule" capsula
+import from "gradus:model/dense" dense
 import from "gradus:model/gguf" gguf
+import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/tensor_payload" tensor_payload
+import from "gradus:model/tensor_view" tensor_view
+import from "gradus:tensor" tensor
 import from "gradus:tokenizer" tokenizator
 
 # ---------------------------------------------------------------------------
@@ -897,6 +910,508 @@ fn run_generate(GenerateConfig cfg, list<int> ids) → list<int> ⇥ generatio.G
 }
 
 # ---------------------------------------------------------------------------
+# I-live — one-shot G2 generate_dense on an admitted GGUF
+#
+# Serve still uses the stub decoder (`generatio.generate` + decode.default)
+# so HTTP/admission tests stay cheap. `live` is the composed provider run:
+# admit → inspect → G3 tokenizer tables → dense weights → generate_dense.
+# ---------------------------------------------------------------------------
+
+fn pinned_digest() → string {
+    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+}
+
+fn pinned_data_offset() → int {
+    return 1787040
+}
+
+fn pinned_slice_cap() → int {
+    return 16777216
+}
+
+# U5 / record.json generated_tokens[0..16] (i1-validation-u5).
+fn golden_tokens_16() → list<int> {
+    return [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
+}
+
+fn live_file_size(string path) → int {
+    return call 'solum:mensura' (path) ↦ int
+}
+
+fn live_read_range(string path, int start, int length) → bytes {
+    const list<value> args ← [path, start, length]
+    return call 'solum:partem' (args) ↦ bytes
+}
+
+fn live_range(string path, int total, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
+    }
+    const bytes raw ← live_read_range(path, initium, longitudo)
+    if raw.length() ≠ longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "short range read" }
+    }
+    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+}
+
+fn live_prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
+    }
+    const list<int> segment ← prefix.slice(initium, initium + longitudo)
+    const bytes raw ← segment ↦ bytes
+    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+}
+
+fn live_ends(string s, string tail) → bool {
+    if tail.length() > s.length() { return false }
+    return s.slice(s.length() - tail.length(), s.length()) ≡ tail
+}
+
+fn live_slot(string nomen) → int {
+    if live_ends(nomen, ".input_layernorm") { return 0 }
+    if live_ends(nomen, ".self_attn.q_proj") { return 1 }
+    if live_ends(nomen, ".self_attn.k_proj") { return 2 }
+    if live_ends(nomen, ".self_attn.v_proj") { return 3 }
+    if live_ends(nomen, ".self_attn.o_proj") { return 4 }
+    if live_ends(nomen, ".post_attention_layernorm") { return 5 }
+    if live_ends(nomen, ".mlp.gate_proj") { return 6 }
+    if live_ends(nomen, ".mlp.up_proj") { return 7 }
+    if live_ends(nomen, ".mlp.down_proj") { return 8 }
+    return -1
+}
+
+fn live_ids_text(list<int> ids) → string {
+    var string out ← "["
+    var int i ← 0
+    while i < ids.length() {
+        if i > 0 { out ← out + ", " }
+        out ← out + ((ids.get(i) coalesce 0) ↦ string)
+        i ← i + 1
+    }
+    return out + "]"
+}
+
+fn live_block_elements(tensor_view.TensorView v) → int {
+    match v.layout {
+        case manifestum.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+            return elementa_per_blockum
+        }
+        case manifestum.Ignota const typo {
+            return 0
+        }
+    }
+}
+
+fn live_window(int remaining, int block) → int {
+    if remaining ≤ pinned_slice_cap() { return remaining }
+    const int aligned ← (pinned_slice_cap() / block) * block
+    if aligned < block { return block }
+    return aligned
+}
+
+fn live_limits(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> {
+    do {
+        return manifestum.limes_payloadis(m, gguf_name)
+    }
+    catch err {
+        panic "payload range failed for " + gguf_name + ": " + manifestum.message(err)
+    }
+}
+
+fn live_bind(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView {
+    do {
+        return tensor_view.links(m, p)
+    }
+    catch err {
+        panic "view bind failed for " + p.name + ": " + tensor_view.message(err)
+    }
+}
+
+fn live_slice(tensor_view.TensorView v, int off, int n, (int, int) → manifestum.SourceRead fons) → list<f32> {
+    do {
+        return tensor_view.materialize_slice(v, off, n, fons)
+    }
+    catch err {
+        panic "window materialize failed for " + v.name + ": " + tensor_view.message(err)
+    }
+}
+
+fn live_tensor(list<f32> datos, list<int> forma) → tensor.Tensor {
+    do {
+        return tensor.construct(datos, forma)
+    }
+    catch err {
+        panic "tensor construct failed: " + tensor.message(err)
+    }
+}
+
+fn live_materialize(string via, int total, manifestum.GgufManifest m, string gguf_name) → tensor.Tensor {
+    const tuple<int, int> limes ← live_limits(m, gguf_name)
+    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+        name = gguf_name,
+        absolute_start = limes[0],
+        length = limes[1],
+        bytes = ||
+    }
+    const tensor_view.TensorView v ← live_bind(m, p)
+    const int block ← live_block_elements(v)
+    if block < 1 {
+        panic "tensor layout has no block size: " + gguf_name
+    }
+    var list<f32> datos ← []
+    var int off ← 0
+    while off < v.elements {
+        const int n ← live_window(v.elements - off, block)
+        const list<f32> part ← live_slice(
+            v,
+            off,
+            n,
+            (int initium, int longitudo) → manifestum.SourceRead ∴ live_range(via, total, initium, longitudo)
+        )
+        var int pi ← 0
+        while pi < part.length() {
+            datos.append(part.get(pi) coalesce (0.0 ∷ f32))
+            pi ← pi + 1
+        }
+        off ← off + n
+    }
+    return live_tensor(datos, v.shape)
+}
+
+fn live_gguf_name(string family, int stratum) → string {
+    if family ≡ "model.embed_tokens" { return "token_embd.weight" }
+    if family ≡ "model.norm" { return "output_norm.weight" }
+    if family ≡ "lm_head" { return "token_embd.weight" }
+    if stratum < 0 or stratum ≥ 32 {
+        panic "layer index outside the frozen llama layer range: " + (stratum ↦ string)
+    }
+    if family ≡ "model.layers.input_layernorm" { return ("blk." + (stratum ↦ string)) + ".attn_norm.weight" }
+    if family ≡ "model.layers.self_attn.q_proj" { return ("blk." + (stratum ↦ string)) + ".attn_q.weight" }
+    if family ≡ "model.layers.self_attn.k_proj" { return ("blk." + (stratum ↦ string)) + ".attn_k.weight" }
+    if family ≡ "model.layers.self_attn.v_proj" { return ("blk." + (stratum ↦ string)) + ".attn_v.weight" }
+    if family ≡ "model.layers.self_attn.o_proj" { return ("blk." + (stratum ↦ string)) + ".attn_output.weight" }
+    if family ≡ "model.layers.post_attention_layernorm" { return ("blk." + (stratum ↦ string)) + ".ffn_norm.weight" }
+    if family ≡ "model.layers.mlp.gate_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_gate.weight" }
+    if family ≡ "model.layers.mlp.up_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_up.weight" }
+    if family ≡ "model.layers.mlp.down_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_down.weight" }
+    panic "unknown canonical tensor name: " + family
+}
+
+fn live_kmajor_to_linear(tensor.Tensor t) → tensor.Tensor {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        panic "linear weight must be rank 2"
+    }
+    const int k ← f.get(0) coalesce 1
+    const int n ← f.get(1) coalesce 1
+    var list<f32> out ← []
+    var int i ← 0
+    while i < k {
+        var int j ← 0
+        while j < n {
+            out.append(t.data.get(j * k + i) coalesce (0.0 ∷ f32))
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    return live_tensor(out, [k, n])
+}
+
+fn live_linear_family(string family) → bool {
+    if family ≡ "lm_head" { return true }
+    if live_ends(family, ".self_attn.q_proj") { return true }
+    if live_ends(family, ".self_attn.k_proj") { return true }
+    if live_ends(family, ".self_attn.v_proj") { return true }
+    if live_ends(family, ".self_attn.o_proj") { return true }
+    if live_ends(family, ".mlp.gate_proj") { return true }
+    if live_ends(family, ".mlp.up_proj") { return true }
+    if live_ends(family, ".mlp.down_proj") { return true }
+    return false
+}
+
+fn live_load_one(string via, int total, manifestum.GgufManifest m, string family, int stratum) → tensor.Tensor {
+    const string gguf_name ← live_gguf_name(family, stratum)
+    const tensor.Tensor stored ← live_materialize(via, total, m, gguf_name)
+    if live_linear_family(family) {
+        return live_kmajor_to_linear(stored)
+    }
+    return stored
+}
+
+fn live_lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, list<list<tensor.Tensor>> strata) → dense.Lookup {
+    if nomen ≡ "model.embed_tokens" { return dense.Lookup { successus = true, tensorem = embed, message = "" } }
+    if nomen ≡ "model.norm" { return dense.Lookup { successus = true, tensorem = norm_s, message = "" } }
+    if stratum < 0 or stratum ≥ strata.length() {
+        return dense.Lookup { successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string) }
+    }
+    const int slot ← live_slot(nomen)
+    if slot < 0 {
+        return dense.Lookup { successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen }
+    }
+    var list<tensor.Tensor> missing ← []
+    const list<tensor.Tensor> row ← strata.get(stratum) coalesce missing
+    if slot ≥ row.length() {
+        return dense.Lookup { successus = false, tensorem = embed, message = "layer slot missing: " + nomen }
+    }
+    const tensor.Tensor t ← row.get(slot) coalesce embed
+    return dense.Lookup { successus = true, tensorem = t, message = "" }
+}
+
+fn live_indices(int n) → list<int> {
+    var list<int> out ← []
+    var int i ← 0
+    while i < n {
+        out.append(i)
+        i ← i + 1
+    }
+    return out
+}
+
+fn live_first_divergence(list<int> observed, list<int> golden) → string {
+    var int i ← 0
+    const int n ← observed.length()
+    const int g ← golden.length()
+    const int lim ← if_int(n < g, n, g)
+    while i < lim {
+        const int a ← observed.get(i) coalesce -1
+        const int b ← golden.get(i) coalesce -2
+        if a ≠ b {
+            return "index " + (i ↦ string) + ": observed " + (a ↦ string) + " vs golden " + (b ↦ string)
+        }
+        i ← i + 1
+    }
+    if n ≠ g {
+        return "length " + (n ↦ string) + " vs golden " + (g ↦ string)
+    }
+    return "none"
+}
+
+fn live_token_match_count(list<int> observed, list<int> golden) → int {
+    var int matches ← 0
+    var int i ← 0
+    const int lim ← if_int(observed.length() < golden.length(), observed.length(), golden.length())
+    while i < lim {
+        const int a ← observed.get(i) coalesce -1
+        const int b ← golden.get(i) coalesce -2
+        if a ≡ b { matches ← matches + 1 }
+        i ← i + 1
+    }
+    return matches
+}
+
+fn live_requested(list<string> argv) → bool {
+    var int i ← 1
+    while i < argv.length() {
+        const string arg ← argv.get(i) coalesce ""
+        if arg ≡ "live" { return true }
+        i ← i + 1
+    }
+    return false
+}
+
+fn live_build_tokenizer(manifestum.GgufManifest m) → tokenizator.Tokenizer {
+    do {
+        return tokenizator.build(m)
+    }
+    catch err {
+        panic "G3 tokenizer tables failed: " + tokenizator.message(err)
+    }
+}
+
+fn live_tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
+    do {
+        return tokenizator.tokenize(tok, prompt)
+    }
+    catch err {
+        panic "G3 tokenize failed: " + tokenizator.message(err)
+    }
+}
+
+fn live_run(ServeConfig config) → void {
+    stdout_write("inferentia live: admit + G3 tokenizer + generate_dense\n")
+    stdout_write("model.path=" + config.model + "\n")
+
+    var string sha ← ""
+    do {
+        sha ← admit_model(config.model)
+    }
+    catch err {
+        panic "admit failed: " + gguf.message(err)
+    }
+    stdout_write("admit.sha256=" + sha + "\n")
+    if sha ≠ pinned_digest() {
+        panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
+    }
+
+    const int total ← live_file_size(config.model)
+    stdout_write("model.bytes=" + (total ↦ string) + "\n")
+    if total ≠ model_file_size_bytes() {
+        panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (model_file_size_bytes() ↦ string)
+    }
+
+    const int data_offset ← pinned_data_offset()
+    const bytes prefix_bytes ← live_read_range(config.model, 0, data_offset)
+    if prefix_bytes.length() ≠ data_offset {
+        panic "table-prefix read was short"
+    }
+    const value prefix_valor ← prefix_bytes ↦ value
+    const list<int> prefix ← prefix_valor ↦ list<int>
+    const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
+        algorithm = "sha-256",
+        digest = sha,
+        length = total
+    }
+
+    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
+        identitas = identitas,
+        version = 0,
+        concordatio = 0,
+        data_inceptum = 0,
+        artifact_length = 0,
+        metadata = [],
+        tensors = []
+    }
+    do {
+        admitted ← manifestum.inspect(
+            (int initium, int longitudo) → manifestum.SourceRead ∴ live_prefix_range(prefix, initium, longitudo),
+            total,
+            identitas
+        )
+    }
+    catch err {
+        panic "manifest admission failed: " + manifestum.message(err)
+    }
+    stdout_write("manifest.data_offset=" + (admitted.data_inceptum ↦ string) + "\n")
+
+    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
+    stdout_write("tokenizer.vocab=" + (tok.multitudo ↦ string) + "\n")
+
+    const list<int> prompt_ids ← live_tokenize(tok, frozen_prompt_text())
+    stdout_write("prompt.ids=" + live_ids_text(prompt_ids) + "\n")
+    stdout_write("prompt.golden=" + live_ids_text(frozen_prompt_ids()) + "\n")
+    if live_first_divergence(prompt_ids, frozen_prompt_ids()) ≠ "none" {
+        panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
+    }
+
+    var tensor.Tensor embed ← tensor.default()
+    var tensor.Tensor norm_s ← tensor.default()
+    embed ← live_load_one(config.model, total, admitted, "model.embed_tokens", 0)
+    norm_s ← live_load_one(config.model, total, admitted, "model.norm", 0)
+
+    const list<string> families ← [
+        "model.layers.input_layernorm",
+        "model.layers.self_attn.q_proj",
+        "model.layers.self_attn.k_proj",
+        "model.layers.self_attn.v_proj",
+        "model.layers.self_attn.o_proj",
+        "model.layers.post_attention_layernorm",
+        "model.layers.mlp.gate_proj",
+        "model.layers.mlp.up_proj",
+        "model.layers.mlp.down_proj"
+    ]
+    var list<list<tensor.Tensor>> strata ← []
+    var int stratum ← 0
+    while stratum < 32 {
+        var list<tensor.Tensor> row ← []
+        var int f ← 0
+        while f < families.length() {
+            row.append(live_load_one(config.model, total, admitted, families.get(f) coalesce "", stratum))
+            f ← f + 1
+        }
+        strata.append(row)
+        stderr_write("inferentia live: loaded layer " + (stratum ↦ string) + "\n")
+        stratum ← stratum + 1
+    }
+
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+    }
+    catch err {
+        panic "rope config failed: " + attention.message(err)
+    }
+
+    const dense.DenseConfig architecture ← dense.DenseConfig {
+        layers = 32,
+        heads = 15,
+        kv_heads = 5,
+        head_dim = 64,
+        hidden_dim = 960,
+        vocab = model_vocab_size(),
+        tied = true
+    }
+
+    var kv.KVStructure structure ← kv.default_kv_structure()
+    do {
+        const kv.LayerSet set ← kv.construct_layer_set(live_indices(32), kv.dense_structure(), 5, 64)
+        var list<kv.LayerSet> sets ← []
+        sets.append(set)
+        structure ← kv.construct_kv_structure(
+            sets,
+            kv.kv_dtype_f32(),
+            kv.kv_dtype_f32(),
+            kv.v_layout_transposed(),
+            kv.sharing_gqa(),
+            kv.attention_classic(),
+            15,
+            8192,
+            8192
+        )
+    }
+    catch err {
+        panic "kv structure failed: " + kv.message(err)
+    }
+
+    var list<kv.KVCache> layers ← []
+    do {
+        layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
+    }
+    catch err {
+        panic "empty caches failed: " + dense.message(err)
+    }
+    stdout_write("cache.layers=" + (layers.length() ↦ string) + "\n")
+
+    var generatio.GenerationConfig gen ← generatio.default()
+    do {
+        gen ← generatio.construct_generation(8192, 1, 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+    }
+    catch err {
+        panic "generation config failed: " + generatio.message(err)
+    }
+    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+
+    var list<int> generated ← []
+    do {
+        generated ← generatio.generate_dense(
+            gen,
+            prompt_ids,
+            engine,
+            (string n, int s) → dense.Lookup ∴ live_lookup(n, s, embed, norm_s, strata),
+            layers,
+            decode.fresh_cancellation()
+        )
+    }
+    catch err {
+        panic "generate_dense failed: " + generatio.message(err)
+    }
+
+    const list<int> golden ← golden_tokens_16()
+    const string divergence ← live_first_divergence(generated, golden)
+    const int matches ← live_token_match_count(generated, golden)
+    stdout_write("observed=" + live_ids_text(generated) + "\n")
+    stdout_write("golden=" + live_ids_text(golden) + "\n")
+    stdout_write("observed.n=" + (generated.length() ↦ string) + "\n")
+    stdout_write("token_match_count=" + (matches ↦ string) + "\n")
+    stdout_write("first_divergence=" + divergence + "\n")
+    if divergence ≡ "none" {
+        stdout_write("LIVE: PASS\n")
+    } else {
+        stdout_write("LIVE: FAIL\n")
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Usage errors (D5): detected before any listen, non-zero exit.
 # ---------------------------------------------------------------------------
 fn usage_error(string message) → never {
@@ -916,9 +1431,13 @@ fn parse_int(string raw) → int {
 
 # The D1 `serve` syntax, printed on `--help`.
 fn print_help() → void {
-    stdout_write("Usage: inferentia serve [OPTIONS]\n")
+    stdout_write("Usage: inferentia <serve|live> [OPTIONS]\n")
     stdout_write("\n")
     stdout_write("Local-first GGUF inference server written in Faber\n")
+    stdout_write("\n")
+    stdout_write("Commands:\n")
+    stdout_write("  serve                     Bind the HTTP server (U1–U4)\n")
+    stdout_write("  live                      One-shot G2 generate_dense vs the U5 golden\n")
     stdout_write("\n")
     stdout_write("Options:\n")
     stdout_write("  -m, --model <PATH>        Path to the GGUF model file (required)\n")
@@ -1014,9 +1533,9 @@ fn parse_cli(list<string> argv) → ServeConfig {
         i ← i + 1
     }
 
-    if subcommand ≡ "" then usage_error("missing subcommand 'serve'")
-    if subcommand ≡ "serve" {
-        # ok — serve is the only subcommand in I1 (D1)
+    if subcommand ≡ "" then usage_error("missing subcommand 'serve' or 'live'")
+    if subcommand ≡ "serve" or subcommand ≡ "live" {
+        # serve: HTTP (U1–U4). live: one-shot generate_dense (I-live).
     } else {
         usage_error("unknown subcommand '" + subcommand + "'")
     }
@@ -1300,7 +1819,11 @@ fn serve(ServeConfig config) → void {
 # ---------------------------------------------------------------------------
 main args argv {
     const ServeConfig config ← parse_cli(argv)
-    serve(config)
+    if live_requested(argv) {
+        live_run(config)
+    } else {
+        serve(config)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1858,12 @@ describe "serve cli parse" tag "inferentia" {
     test "short model flag binds the same option" {
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "-m", "/tmp/model.gguf"])
         assert cfg.model ≡ "/tmp/model.gguf"
+    }
+    test "live subcommand accepts the model path" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf"])
+        assert cfg.model ≡ "/tmp/model.gguf"
+        assert live_requested(["inferentia", "live", "--model", "/tmp/model.gguf"])
+        assert not live_requested(["inferentia", "serve", "--model", "/tmp/model.gguf"])
     }
     test "context is unset until a flag provides it" {
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
