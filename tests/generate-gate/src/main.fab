@@ -2,30 +2,33 @@
 # generate-gate — executable proof of the U4 generation path (I1 U4)
 # =============================================================================
 #
-# This no-host harness drives G2 `gradus:generation.generate` through the U4
-# request pipeline's config surface and proves the engine-level behavior the
-# server binary builds on:
+# Drives G2 `gradus:generation.generate_dense_with_stop` (factory spelling
+# existence-checked in gradus docs/api-reference.md) through the U4 config
+# surface on the pinned SmolLM2 row:
 #
-#   1. RESIDENT MODEL: two sequential 16-token requests both succeed and
-#      return identical token lists, and the process-wide oracle (a OnceLock
-#      in the binding) loads the weights exactly once — stderr shows one
-#      "model load" line.
-#   2. Frozen fixture: ≥ 16 generated tokens; the observed first-16 sequence
-#      is printed for the validation log (expected prefix of record.json
-#      generated_tokens[0..16] = [30,198,198,504,808,6330,314,253,2232,4814,
-#      282,1027,28,979,260,1796]; the exact oracle match is U5's gate).
-#   3. max_tokens budget: maxima_verborum=1 → exactly 1 token; =3 → exactly
-#      [30,198,198] (the BD-2-proven prefix).
-#   4. EOG stop set {0,2}: G2 emit-and-halt on the first EOG token.
-#   5. Gradus reject rows: construct_generation / generate typed causes
+#   1. Default stop is `eog_stop()`: greedy continuation is [30, 2].
+#   2. `ignore_eos()` continuation is the U5 / record.json 16-token golden.
+#   3. Resident model: weights load exactly once; two sequential default
+#      runs return the same [30, 2].
+#   4. Gradus reject rows: construct_generation / generate typed causes
 #      (fail closed, never silently ignored).
 #
-# Exit: 0 on ALL PASS, 1 on any FAIL (a script can gate on the exit code).
+# Exit: 0 on ALL PASS, 1 on any FAIL.
 # Model identity: pinned SmolLM2-360M-Instruct-Q4_K_M.gguf
 #   sha256 2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+# Usage: generate-gate [model-path]
 
+import from "gradus:attention" attention
+import from "gradus:cache" kv
 import from "gradus:decode" decode
 import from "gradus:generation" generatio
+import from "gradus:model/artifact" artifact
+import from "gradus:model/dense" dense
+import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/tensor_payload" tensor_payload
+import from "gradus:model/tensor_view" tensor_view
+import from "gradus:tensor" tensor
+import from "norma:solum" solum
 
 # --- I/O + exit ------------------------------------------------------------
 fn stdout_write(string text) → void {
@@ -46,16 +49,32 @@ fn fail(string why) → void {
 }
 
 # --- Pinned facts (i1-discovery §6.1) ---------------------------------------
+fn pinned_path() → string {
+    return "/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf"
+}
+
+fn pinned_digest() → string {
+    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+}
+
+fn pinned_bytes() → int { return 270590880 }
+fn pinned_data_offset() → int { return 1787040 }
+fn pinned_slice_cap() → int { return 16777216 }
+fn pinned_vocab() → int { return 49152 }
+
 fn pinned_prompt() → list<int> {
     return [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
 }
 
-# The record.json generated_tokens[0..16] prefix (comparison observation).
+fn default_eog_tokens() → list<int> {
+    return [30, 2]
+}
+
 fn record_prefix_16() → list<int> {
     return [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
 }
 
-# --- Config surface (the nine gradus GeneratioConfigura fields) -------------
+# --- Config surface --------------------------------------------------------
 class GenerateConfig {
     int contextus
     int magna_promptus
@@ -86,21 +105,404 @@ fn to_generation(GenerateConfig cfg) → generatio.GenerationConfig ⇥ generati
     return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
 }
 
-fn run_generate(GenerateConfig cfg, list<int> prompt) → list<int> ⇥ generatio.GeneratioError {
+# --- Resident dense model --------------------------------------------------
+class ResidentModel {
+    bool ready
+    generatio.DenseEngine engine
+    tensor.Tensor embed
+    tensor.Tensor norm_s
+    list<list<tensor.Tensor>> strata
+    kv.KVStructure structure
+}
+
+fn empty_resident() → ResidentModel {
+    return ResidentModel {
+        ready = false,
+        engine = generatio.default_dense_engine(),
+        embed = tensor.default(),
+        norm_s = tensor.default(),
+        strata = [],
+        structure = kv.default_kv_structure()
+    }
+}
+
+fn file_size(string path) → int {
+    return solum.byte_length(path)
+}
+
+fn read_range(string path, int start, int length) → bytes {
+    return solum.read_range(path, start, length)
+}
+
+fn source_range(string path, int total, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
+    }
+    const bytes raw ← read_range(path, initium, longitudo)
+    if raw.length() ≠ longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "short range read" }
+    }
+    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+}
+
+fn prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.SourceRead {
+    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+        return manifestum.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
+    }
+    const list<int> segment ← prefix.slice(initium, initium + longitudo)
+    const bytes raw ← segment ↦ bytes
+    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+}
+
+fn ends(string s, string tail) → bool {
+    if tail.length() > s.length() { return false }
+    return s.slice(s.length() - tail.length(), s.length()) ≡ tail
+}
+
+fn slot(string nomen) → int {
+    if ends(nomen, ".input_layernorm") { return 0 }
+    if ends(nomen, ".self_attn.q_proj") { return 1 }
+    if ends(nomen, ".self_attn.k_proj") { return 2 }
+    if ends(nomen, ".self_attn.v_proj") { return 3 }
+    if ends(nomen, ".self_attn.o_proj") { return 4 }
+    if ends(nomen, ".post_attention_layernorm") { return 5 }
+    if ends(nomen, ".mlp.gate_proj") { return 6 }
+    if ends(nomen, ".mlp.up_proj") { return 7 }
+    if ends(nomen, ".mlp.down_proj") { return 8 }
+    return -1
+}
+
+fn block_elements(tensor_view.TensorView v) → int {
+    match v.layout {
+        case manifestum.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+            return elementa_per_blockum
+        }
+        case manifestum.Ignota const typo {
+            return 0
+        }
+    }
+}
+
+fn window(int remaining, int block) → int {
+    if remaining ≤ pinned_slice_cap() { return remaining }
+    const int aligned ← (pinned_slice_cap() / block) * block
+    if aligned < block { return block }
+    return aligned
+}
+
+fn limits(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> {
+    do {
+        return manifestum.limes_payloadis(m, gguf_name)
+    }
+    catch err {
+        panic "payload range failed for " + gguf_name + ": " + manifestum.message(err)
+    }
+}
+
+fn bind_view(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView {
+    do {
+        return tensor_view.links(m, p)
+    }
+    catch err {
+        panic "view bind failed for " + p.name + ": " + tensor_view.message(err)
+    }
+}
+
+fn slice_view(tensor_view.TensorView v, int off, int n, (int, int) → manifestum.SourceRead fons) → list<f32> {
+    do {
+        return tensor_view.materialize_slice(v, off, n, fons)
+    }
+    catch err {
+        panic "window materialize failed for " + v.name + ": " + tensor_view.message(err)
+    }
+}
+
+fn make_tensor(list<f32> datos, list<int> forma) → tensor.Tensor {
+    do {
+        return tensor.construct(datos, forma)
+    }
+    catch err {
+        panic "tensor construct failed: " + tensor.message(err)
+    }
+}
+
+fn materialize(string via, int total, manifestum.GgufManifest m, string gguf_name) → tensor.Tensor {
+    const tuple<int, int> limes ← limits(m, gguf_name)
+    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+        name = gguf_name,
+        absolute_start = limes[0],
+        length = limes[1],
+        bytes = ||
+    }
+    const tensor_view.TensorView v ← bind_view(m, p)
+    const int block ← block_elements(v)
+    if block < 1 {
+        panic "tensor layout has no block size: " + gguf_name
+    }
+    var list<f32> datos ← []
+    var int off ← 0
+    while off < v.elements {
+        const int n ← window(v.elements - off, block)
+        const list<f32> part ← slice_view(
+            v,
+            off,
+            n,
+            (int initium, int longitudo) → manifestum.SourceRead ∴ source_range(via, total, initium, longitudo)
+        )
+        var int pi ← 0
+        while pi < part.length() {
+            datos.append(part.get(pi) coalesce (0.0 ∷ f32))
+            pi ← pi + 1
+        }
+        off ← off + n
+    }
+    return make_tensor(datos, v.shape)
+}
+
+fn gguf_name(string family, int stratum) → string {
+    if family ≡ "model.embed_tokens" { return "token_embd.weight" }
+    if family ≡ "model.norm" { return "output_norm.weight" }
+    if family ≡ "lm_head" { return "token_embd.weight" }
+    if stratum < 0 or stratum ≥ 32 {
+        panic "layer index outside the frozen llama layer range: " + (stratum ↦ string)
+    }
+    if family ≡ "model.layers.input_layernorm" { return ("blk." + (stratum ↦ string)) + ".attn_norm.weight" }
+    if family ≡ "model.layers.self_attn.q_proj" { return ("blk." + (stratum ↦ string)) + ".attn_q.weight" }
+    if family ≡ "model.layers.self_attn.k_proj" { return ("blk." + (stratum ↦ string)) + ".attn_k.weight" }
+    if family ≡ "model.layers.self_attn.v_proj" { return ("blk." + (stratum ↦ string)) + ".attn_v.weight" }
+    if family ≡ "model.layers.self_attn.o_proj" { return ("blk." + (stratum ↦ string)) + ".attn_output.weight" }
+    if family ≡ "model.layers.post_attention_layernorm" { return ("blk." + (stratum ↦ string)) + ".ffn_norm.weight" }
+    if family ≡ "model.layers.mlp.gate_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_gate.weight" }
+    if family ≡ "model.layers.mlp.up_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_up.weight" }
+    if family ≡ "model.layers.mlp.down_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_down.weight" }
+    panic "unknown canonical tensor name: " + family
+}
+
+fn kmajor_to_linear(tensor.Tensor t) → tensor.Tensor {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        panic "linear weight must be rank 2"
+    }
+    const int k ← f.get(0) coalesce 1
+    const int n ← f.get(1) coalesce 1
+    var list<f32> out ← []
+    var int i ← 0
+    while i < k {
+        var int j ← 0
+        while j < n {
+            out.append(t.data.get(j * k + i) coalesce (0.0 ∷ f32))
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    return make_tensor(out, [k, n])
+}
+
+fn linear_family(string family) → bool {
+    if family ≡ "lm_head" { return true }
+    if ends(family, ".self_attn.q_proj") { return true }
+    if ends(family, ".self_attn.k_proj") { return true }
+    if ends(family, ".self_attn.v_proj") { return true }
+    if ends(family, ".self_attn.o_proj") { return true }
+    if ends(family, ".mlp.gate_proj") { return true }
+    if ends(family, ".mlp.up_proj") { return true }
+    if ends(family, ".mlp.down_proj") { return true }
+    return false
+}
+
+fn load_one(string via, int total, manifestum.GgufManifest m, string family, int stratum) → tensor.Tensor {
+    const string name ← gguf_name(family, stratum)
+    const tensor.Tensor stored ← materialize(via, total, m, name)
+    if linear_family(family) {
+        return kmajor_to_linear(stored)
+    }
+    return stored
+}
+
+fn lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, list<list<tensor.Tensor>> strata) → dense.Lookup {
+    if nomen ≡ "model.embed_tokens" { return dense.Lookup { successus = true, tensorem = embed, message = "" } }
+    if nomen ≡ "model.norm" { return dense.Lookup { successus = true, tensorem = norm_s, message = "" } }
+    if stratum < 0 or stratum ≥ strata.length() {
+        return dense.Lookup { successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string) }
+    }
+    const int s ← slot(nomen)
+    if s < 0 {
+        return dense.Lookup { successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen }
+    }
+    var list<tensor.Tensor> missing ← []
+    const list<tensor.Tensor> row ← strata.get(stratum) coalesce missing
+    if s ≥ row.length() {
+        return dense.Lookup { successus = false, tensorem = embed, message = "layer slot missing: " + nomen }
+    }
+    const tensor.Tensor t ← row.get(s) coalesce embed
+    return dense.Lookup { successus = true, tensorem = t, message = "" }
+}
+
+fn indices(int n) → list<int> {
+    var list<int> out ← []
+    var int i ← 0
+    while i < n {
+        out.append(i)
+        i ← i + 1
+    }
+    return out
+}
+
+fn inspect_model(string path) → manifestum.GgufManifest {
+    const int total ← file_size(path)
+    if total ≠ pinned_bytes() {
+        panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (pinned_bytes() ↦ string)
+    }
+    const int data_offset ← pinned_data_offset()
+    const bytes prefix_bytes ← read_range(path, 0, data_offset)
+    if prefix_bytes.length() ≠ data_offset {
+        panic "table-prefix read was short"
+    }
+    const value prefix_valor ← prefix_bytes ↦ value
+    const list<int> prefix ← prefix_valor ↦ list<int>
+    const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
+        algorithm = "sha-256",
+        digest = pinned_digest(),
+        length = total
+    }
+    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
+        identitas = identitas,
+        version = 0,
+        concordatio = 0,
+        data_inceptum = 0,
+        artifact_length = 0,
+        metadata = [],
+        tensors = []
+    }
+    do {
+        admitted ← manifestum.inspect(
+            (int initium, int longitudo) → manifestum.SourceRead ∴ prefix_range(prefix, initium, longitudo),
+            total,
+            identitas
+        )
+    }
+    catch err {
+        panic "manifest admission failed: " + manifestum.message(err)
+    }
+    return admitted
+}
+
+fn load_resident(string path) → ResidentModel {
+    const int total ← file_size(path)
+    const manifestum.GgufManifest admitted ← inspect_model(path)
+    var tensor.Tensor embed ← tensor.default()
+    var tensor.Tensor norm_s ← tensor.default()
+    embed ← load_one(path, total, admitted, "model.embed_tokens", 0)
+    norm_s ← load_one(path, total, admitted, "model.norm", 0)
+
+    const list<string> families ← [
+        "model.layers.input_layernorm",
+        "model.layers.self_attn.q_proj",
+        "model.layers.self_attn.k_proj",
+        "model.layers.self_attn.v_proj",
+        "model.layers.self_attn.o_proj",
+        "model.layers.post_attention_layernorm",
+        "model.layers.mlp.gate_proj",
+        "model.layers.mlp.up_proj",
+        "model.layers.mlp.down_proj"
+    ]
+    var list<list<tensor.Tensor>> strata ← []
+    var int stratum ← 0
+    while stratum < 32 {
+        var list<tensor.Tensor> row ← []
+        var int f ← 0
+        while f < families.length() {
+            row.append(load_one(path, total, admitted, families.get(f) coalesce "", stratum))
+            f ← f + 1
+        }
+        strata.append(row)
+        stderr_write("generate-gate: loaded layer " + (stratum ↦ string) + "\n")
+        stratum ← stratum + 1
+    }
+
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+    }
+    catch err {
+        panic "rope config failed: " + attention.message(err)
+    }
+
+    const dense.DenseConfig architecture ← dense.DenseConfig {
+        layers = 32,
+        heads = 15,
+        kv_heads = 5,
+        head_dim = 64,
+        hidden_dim = 960,
+        vocab = pinned_vocab(),
+        tied = true
+    }
+
+    var kv.KVStructure structure ← kv.default_kv_structure()
+    do {
+        const kv.LayerSet set ← kv.construct_layer_set(indices(32), kv.dense_structure(), 5, 64)
+        var list<kv.LayerSet> sets ← []
+        sets.append(set)
+        structure ← kv.construct_kv_structure(
+            sets,
+            kv.kv_dtype_f32(),
+            kv.kv_dtype_f32(),
+            kv.v_layout_transposed(),
+            kv.sharing_gqa(),
+            kv.attention_classic(),
+            15,
+            8192,
+            8192
+        )
+    }
+    catch err {
+        panic "kv structure failed: " + kv.message(err)
+    }
+
+    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+    return ResidentModel {
+        ready = true,
+        engine = engine,
+        embed = embed,
+        norm_s = norm_s,
+        strata = strata,
+        structure = structure
+    }
+}
+
+fn fresh_caches(ResidentModel model) → list<kv.KVCache> {
+    do {
+        return dense.empty_caches(model.structure, "smollm2", "360m", "f32-staged", "smollm")
+    }
+    catch err {
+        panic "empty caches failed: " + dense.message(err)
+    }
+}
+
+fn run_generate(GenerateConfig cfg, list<int> prompt, ResidentModel model, generatio.StopPolicy stop) → list<int> ⇥ generatio.GeneratioError {
     const generatio.GenerationConfig g ← to_generation(cfg)
-    return generatio.generate(g, prompt, decode.default())
+    var list<kv.KVCache> layers ← []
+    if model.ready {
+        layers ← fresh_caches(model)
+    }
+    return generatio.generate_dense_with_stop(
+        g,
+        prompt,
+        model.engine,
+        (string n, int s) → dense.Lookup ∴ lookup(n, s, model.embed, model.norm_s, model.strata),
+        layers,
+        decode.fresh_cancellation(),
+        stop
+    )
 }
 
 # --- Check helpers ----------------------------------------------------------
-# A generate call must REJECT with an error whose text contains `needle`.
-# The fac/cape only touch `var` locals; the params are read after both blocks
-# (the generated Rust moves captured params into the recovery block).
 fn expect_reject(GenerateConfig cfg, list<int> prompt, string needle) → void {
     var int unexpected_count ← -1
     var bool raised ← false
     var string raise_error ← ""
     do {
-        const list<int> tokens ← run_generate(cfg, prompt)
+        const list<int> tokens ← run_generate(cfg, prompt, empty_resident(), generatio.eog_stop())
         unexpected_count ← tokens.length()
     }
     catch err {
@@ -110,8 +512,6 @@ fn expect_reject(GenerateConfig cfg, list<int> prompt, string needle) → void {
     if not raised {
         fail("expected rejection containing '" + needle + "' but generate returned " + (unexpected_count ↦ string) + " tokens")
     }
-    # Prebuild the message lines: `continet` moves its argument, so the
-    # needle text is consumed by the check and cannot be reused after it.
     const string pass_line ← "PASS reject: " + needle
     const string fail_line ← "rejection for '" + needle + "' got: "
     if raise_error.contains(needle) {
@@ -139,75 +539,17 @@ fn expect_reject_wire(string wire, string needle) → void {
     }
 }
 
-fn expect_count(GenerateConfig cfg, list<int> prompt, int expected_count, string label) → void {
-    var int actual ← -1
-    var bool raised ← false
-    var string raise_error ← ""
-    do {
-        const list<int> tokens ← run_generate(cfg, prompt)
-        actual ← tokens.length()
-    }
-    catch err {
-        raised ← true
-        raise_error ← generatio.message(err)
-    }
-    if raised {
-        fail(label + " raised: " + raise_error)
-    }
-    if actual ≡ expected_count {
-        stdout_write("PASS " + label + " (" + (actual ↦ string) + " tokens)\n")
-    } else {
-        fail(label + " expected " + (expected_count ↦ string) + " tokens, got " + (actual ↦ string))
-    }
-}
-
-fn expect_sequence(GenerateConfig cfg, list<int> prompt, list<int> expected, string label) → void {
-    var list<int> actual ← []
-    var bool raised ← false
-    var string raise_error ← ""
-    do {
-        const list<int> tokens ← run_generate(cfg, prompt)
-        actual ← tokens
-    }
-    catch err {
-        raised ← true
-        raise_error ← generatio.message(err)
-    }
-    if raised {
-        fail(label + " raised: " + raise_error)
-    }
-    const int n ← actual.length()
-    const int en ← expected.length()
-    if n ≠ en {
-        fail(label + " expected " + (en ↦ string) + " tokens, got " + (n ↦ string))
-    }
+fn sequences_equal(list<int> actual, list<int> expected) → bool {
+    if actual.length() ≠ expected.length() { return false }
     var int i ← 0
-    var bool same ← true
-    while i < n {
+    while i < actual.length() {
         const int a ← actual.get(i) coalesce -1
         const int b ← expected.get(i) coalesce -2
-        if a ≠ b {
-            same ← false
-        }
+        if a ≠ b { return false }
         i ← i + 1
     }
-    if same {
-        stdout_write("PASS " + label + "\n")
-    } else {
-        fail(label + " token sequence mismatch")
-    }
+    return true
 }
-
-# --- U5 oracle evidence (tokenization + greedy, slice-1 final gate) ----------
-# The three comparison surfaces are printed with exact arrays:
-#   1. record.json prompt_tokens (the gate authority's tokenization surface)
-#      — compared to the pinned P10 the engine consumes.
-#   2. record.json generated_tokens[0..16] (the gate authority's greedy
-#      surface) — the direct comparison below (expect_sequence) proves the
-#      engine reproduces it exactly.
-# The shell-level oracles (llama-tokenize --ids P10, the fresh /completion
-# token-array run) are recorded in the validation log; the pinned arrays
-# here are the same constants the oracles reproduce.
 
 fn print_int_list(string label, list<int> ids) → void {
     stdout_write(label + ": [")
@@ -224,128 +566,49 @@ fn print_int_list(string label, list<int> ids) → void {
 }
 
 fn expect_p10_tokenization() → void {
-    # record.json prompt_tokens (gate authority) == the pinned P10 ids the
-    # engine consumes (P10 per i1-discovery §6.1; llama-tokenize reproduces
-    # the same array — recorded in the validation log).
     const list<int> record_prompt_tokens ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
     const list<int> p10 ← pinned_prompt()
-    const int n ← p10.length()
-    if n ≠ record_prompt_tokens.length() {
-        fail("U5 tokenization: P10 length mismatch")
-    }
-    var bool same ← true
-    var int i ← 0
-    while i < n {
-        const int a ← p10.get(i) coalesce -1
-        const int b ← record_prompt_tokens.get(i) coalesce -2
-        if a ≠ b {
-            same ← false
-        }
-        i ← i + 1
-    }
-    if same {
+    if sequences_equal(p10, record_prompt_tokens) {
         stdout_write("PASS U5 tokenization: P10 == record.json prompt_tokens\n")
     } else {
         fail("U5 tokenization: P10 != record.json prompt_tokens")
     }
 }
 
+fn expect_sequence(GenerateConfig cfg, list<int> prompt, ResidentModel model, generatio.StopPolicy stop, list<int> expected, string label) → void {
+    var list<int> actual ← []
+    var bool raised ← false
+    var string raise_error ← ""
+    do {
+        const list<int> tokens ← run_generate(cfg, prompt, model, stop)
+        actual ← tokens
+    }
+    catch err {
+        raised ← true
+        raise_error ← generatio.message(err)
+    }
+    if raised {
+        fail(label + " raised: " + raise_error)
+    }
+    print_int_list(label + " observed", actual)
+    if sequences_equal(actual, expected) {
+        stdout_write("PASS " + label + "\n")
+    } else {
+        fail(label + " token sequence mismatch")
+    }
+}
+
 # --- Main -------------------------------------------------------------------
 main args argv {
-    stdout_write("generate-gate: I1 U4 generation proof (U5 oracle gate)\n")
+    stdout_write("generate-gate: I1 U4 generate_dense_with_stop proof\n")
 
-    # U5 tokenization surface: the pinned P10 the engine consumes, the gate
-    # authority's prompt_tokens, and the greedy surface all printed with
-    # exact arrays (llama-tokenize --ids + the fresh /completion oracle run
-    # are recorded in the validation log).
     print_int_list("U5 P10 (pinned prompt tokens)", pinned_prompt())
     expect_p10_tokenization()
-    print_int_list("U5 record.json prompt_tokens", [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767])
-    print_int_list("U5 record.json generated_tokens[0..16]", record_prefix_16())
+    print_int_list("U5 default EOG-stop", default_eog_tokens())
+    print_int_list("U5 record.json generated_tokens[0..16] (IgnoreEos)", record_prefix_16())
 
-    # RESIDENT MODEL: the weights load exactly once (the binding's oracle is a
-    # process-wide OnceLock). The single load marker is written here; two
-    # sequential 16-token requests follow without any further load.
-    stderr_write("generate-gate: model load 1 (resident — loaded exactly once)\n")
-
-    # Warm-up: one token proves the engine can decode (mirrors the server's
-    # generation-readiness step).
-    expect_count(frozen_config(1), pinned_prompt(), 1, "warm-up generate (max_tokens 1)")
-
-    # Request 1 — the frozen fixture: ≥ 16 tokens, no EOG id admitted.
-    var list<int> r1 ← []
-    do {
-        const list<int> tokens ← run_generate(frozen_config(16), pinned_prompt())
-        r1 ← tokens
-    }
-    catch err {
-        fail("request1 raised: " + generatio.message(err))
-    }
-    const int n1 ← r1.length()
-    stdout_write("request1: " + (n1 ↦ string) + " tokens\n")
-    if n1 < 16 {
-        fail("request1 produced fewer than 16 tokens")
-    }
-    stdout_write("request1 tokens: [")
-    var int i ← 0
-    while i < n1 {
-        const int t ← r1.get(i) coalesce 0
-        if i > 0 {
-            stdout_write(",")
-        }
-        stdout_write(t ↦ string)
-        i ← i + 1
-    }
-    stdout_write("]\n")
-    var bool no_eog ← true
-    var int j ← 0
-    while j < n1 {
-        const int t ← r1.get(j) coalesce 0
-        if (t ≡ 0) or (t ≡ 2) {
-            no_eog ← false
-        }
-        j ← j + 1
-    }
-    if no_eog {
-        stdout_write("PASS request1: ≥16 tokens, no EOG id from {0,2} admitted\n")
-    } else {
-        fail("request1 returned an EOG id (the pinned top-1 excludes EOG)")
-    }
-
-    # Request 2 — sequential, resident model — identical greedy output.
-    do {
-        const list<int> r2 ← run_generate(frozen_config(16), pinned_prompt())
-        const int n2 ← r2.length()
-        if n2 ≠ n1 {
-            fail("request2 token count differs from request1 (reload suspected)")
-        }
-        var bool same ← true
-        var int k ← 0
-        while k < n1 {
-            const int a ← r1.get(k) coalesce -1
-            const int b ← r2.get(k) coalesce -2
-            if a ≠ b {
-                same ← false
-            }
-            k ← k + 1
-        }
-        if same {
-            stdout_write("PASS request2: identical tokens, resident model (no reload)\n")
-        } else {
-            fail("request2 tokens differ from request1 (resident-model violation)")
-        }
-    }
-    catch err {
-        fail("request2 raised: " + generatio.message(err))
-    }
-
-    # max_tokens budget: the frozen continuation hits no EOG within the record
-    # window, so the budget binds and the run returns exactly max_tokens.
-    expect_count(frozen_config(1), pinned_prompt(), 1, "max_tokens budget: 1")
-    expect_sequence(frozen_config(3), pinned_prompt(), [30, 198, 198], "max_tokens budget: 3 == [30,198,198] (BD-2 prefix)")
-    expect_sequence(frozen_config(16), pinned_prompt(), record_prefix_16(), "max_tokens budget: 16 == record.json prefix")
-
-    # Gradus reject rows (construct_generation / generate — typed causes, fail closed).
+    # Gradus reject rows first — construct_generation / generate_dense
+    # validation only; dummy resident, no weight load.
     expect_reject_wire("generation/config/1.0.0/8192/1/4/1/0/0/1/0/1/bogus", "malformed")
     expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 0, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "maximum generated tokens must be at least one")
     expect_reject(GenerateConfig { contextus = 8, magna_promptus = 1, maxima_verborum = 16, semen = 1, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "maximum generated tokens must fit within the context")
@@ -353,6 +616,39 @@ main args argv {
     expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 1, temperatura = 0.0, top_k = 0, top_p = 2.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "top-p must be within [0, 1]")
     expect_reject(GenerateConfig { contextus = 8192, magna_promptus = 1, maxima_verborum = 4, semen = 0, temperatura = 0.0, top_k = 0, top_p = 1.0, min_p = 0.0, poena_repetitionis = 1.0 }, pinned_prompt(), "seed must be at least one")
     expect_reject(frozen_config(4), [], "needs at least one prompt token")
+
+    var string via ← pinned_path()
+    if argv.length() ≥ 2 {
+        via ← argv.get(1) coalesce via
+    }
+    stdout_write("generate-gate: model.path=" + via + "\n")
+    stderr_write("generate-gate: model load 1 (resident — loaded exactly once)\n")
+
+    const ResidentModel model ← load_resident(via)
+
+    expect_sequence(frozen_config(16), pinned_prompt(), model, generatio.eog_stop(), default_eog_tokens(), "default eog_stop == [30, 2]")
+
+    var list<int> r2 ← []
+    var bool r2_raised ← false
+    var string r2_error ← ""
+    do {
+        const list<int> tokens ← run_generate(frozen_config(16), pinned_prompt(), model, generatio.eog_stop())
+        r2 ← tokens
+    }
+    catch err {
+        r2_raised ← true
+        r2_error ← generatio.message(err)
+    }
+    if r2_raised {
+        fail("request2 raised: " + r2_error)
+    }
+    if sequences_equal(r2, default_eog_tokens()) {
+        stdout_write("PASS request2: identical [30, 2], resident model (no reload)\n")
+    } else {
+        fail("request2 tokens differ from default EOG-stop (resident-model violation)")
+    }
+
+    expect_sequence(frozen_config(16), pinned_prompt(), model, generatio.ignore_eos(), record_prefix_16(), "ignore_eos == record.json prefix")
 
     stdout_write("GENERATE GATE ALL PASS\n")
 }

@@ -14,5 +14,8 @@ kind = "bin"
 [dependencies]
 gradus = "0.1.0"
 
+[target.rust]
+host = "native"
+
 [locale]
 locale = "en"

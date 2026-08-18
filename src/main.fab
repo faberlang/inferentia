@@ -24,8 +24,9 @@
 # {0,2} and the max_tokens budget), cancellation checkpoints (D6 seam), and
 # the resident-model proof (weights load exactly once; stderr records the
 # single load). The generation loop itself lives behind
-# `gradus:generation.generate` (G2); this unit owns the request pipeline
-# around it.
+# `gradus:generation.generate_dense_with_stop` (G2; factory spelling
+# existence-checked in gradus docs/api-reference.md). Default stop is
+# `eog_stop()` (D4). This unit owns the request pipeline around it.
 #
 # I-live: `inferentia live --model <PATH>` admits the GGUF through
 # `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
@@ -868,7 +869,7 @@ fn exit_with(int code) → void {
 # Gradus provider composition (ruling 2615e6a9)
 #
 # Admit: path → solum:digestio + solum:hauri → gguf.admit (pinned SmolLM2
-# counts). Tokenize: G3. Generate: G2 generate over an admitted decoder.
+# counts). Tokenize: G3. Generate: G2 generate_dense_with_stop over a resident dense engine.
 # ---------------------------------------------------------------------------
 
 # Pinned SmolLM2 row counts (gi0-model-contract / gguf.proba).
@@ -904,17 +905,57 @@ fn to_generation_config(GenerateConfig cfg) → generatio.GenerationConfig ⇥ g
     return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
 }
 
-fn run_generate(GenerateConfig cfg, list<int> ids) → list<int> ⇥ generatio.GeneratioError {
-    const generatio.GenerationConfig g ← to_generation_config(cfg)
-    return generatio.generate(g, ids, decode.default())
+# Resident dense weights for /generate (loaded once after admit).
+class ResidentModel {
+    bool ready
+    generatio.DenseEngine engine
+    tensor.Tensor embed
+    tensor.Tensor norm_s
+    list<list<tensor.Tensor>> strata
+    kv.KVStructure structure
+    manifestum.GgufManifest manifest
+}
+
+fn empty_manifest() → manifestum.GgufManifest {
+    return manifestum.GgufManifest {
+        identitas = artifact.ContentIdentity { algorithm = "sha-256", digest = "", length = 0 },
+        version = 0,
+        concordatio = 0,
+        data_inceptum = 0,
+        artifact_length = 0,
+        metadata = [],
+        tensors = []
+    }
+}
+
+fn empty_resident() → ResidentModel {
+    return ResidentModel {
+        ready = false,
+        engine = generatio.default_dense_engine(),
+        embed = tensor.default(),
+        norm_s = tensor.default(),
+        strata = [],
+        structure = kv.default_kv_structure(),
+        manifest = empty_manifest()
+    }
+}
+
+fn fresh_resident_caches(ResidentModel model) → list<kv.KVCache> {
+    do {
+        return dense.empty_caches(model.structure, "smollm2", "360m", "f32-staged", "smollm")
+    }
+    catch err {
+        panic "empty caches failed: " + dense.message(err)
+    }
 }
 
 # ---------------------------------------------------------------------------
 # I-live — one-shot G2 generate_dense on an admitted GGUF
 #
-# Serve still uses the stub decoder (`generatio.generate` + decode.default)
-# so HTTP/admission tests stay cheap. `live` is the composed provider run:
-# admit → inspect → G3 tokenizer tables → dense weights → generate_dense.
+# Serve loads the same resident dense weights and calls
+# generate_dense_with_stop with an explicit StopPolicy (default eog_stop).
+# live is the composed provider run: admit → inspect → G3 tokenizer
+# tables → dense weights → generate_dense.
 # ---------------------------------------------------------------------------
 
 fn pinned_digest() → string {
@@ -1228,30 +1269,13 @@ fn live_tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
     }
 }
 
-fn live_run(ServeConfig config) → void {
-    stdout_write("inferentia live: admit + G3 tokenizer + generate_dense\n")
-    stdout_write("model.path=" + config.model + "\n")
-
-    var string sha ← ""
-    do {
-        sha ← admit_model(config.model)
-    }
-    catch err {
-        panic "admit failed: " + gguf.message(err)
-    }
-    stdout_write("admit.sha256=" + sha + "\n")
-    if sha ≠ pinned_digest() {
-        panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
-    }
-
-    const int total ← live_file_size(config.model)
-    stdout_write("model.bytes=" + (total ↦ string) + "\n")
+fn inspect_model(string path, string sha) → manifestum.GgufManifest {
+    const int total ← live_file_size(path)
     if total ≠ model_file_size_bytes() {
         panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (model_file_size_bytes() ↦ string)
     }
-
     const int data_offset ← pinned_data_offset()
-    const bytes prefix_bytes ← live_read_range(config.model, 0, data_offset)
+    const bytes prefix_bytes ← live_read_range(path, 0, data_offset)
     if prefix_bytes.length() ≠ data_offset {
         panic "table-prefix read was short"
     }
@@ -1262,16 +1286,7 @@ fn live_run(ServeConfig config) → void {
         digest = sha,
         length = total
     }
-
-    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
-        identitas = identitas,
-        version = 0,
-        concordatio = 0,
-        data_inceptum = 0,
-        artifact_length = 0,
-        metadata = [],
-        tensors = []
-    }
+    var manifestum.GgufManifest admitted ← empty_manifest()
     do {
         admitted ← manifestum.inspect(
             (int initium, int longitudo) → manifestum.SourceRead ∴ live_prefix_range(prefix, initium, longitudo),
@@ -1282,22 +1297,15 @@ fn live_run(ServeConfig config) → void {
     catch err {
         panic "manifest admission failed: " + manifestum.message(err)
     }
-    stdout_write("manifest.data_offset=" + (admitted.data_inceptum ↦ string) + "\n")
+    return admitted
+}
 
-    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
-    stdout_write("tokenizer.vocab=" + (tok.multitudo ↦ string) + "\n")
-
-    const list<int> prompt_ids ← live_tokenize(tok, frozen_prompt_text())
-    stdout_write("prompt.ids=" + live_ids_text(prompt_ids) + "\n")
-    stdout_write("prompt.golden=" + live_ids_text(frozen_prompt_ids()) + "\n")
-    if live_first_divergence(prompt_ids, frozen_prompt_ids()) ≠ "none" {
-        panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
-    }
-
+fn load_resident_weights(string path, manifestum.GgufManifest admitted) → ResidentModel {
+    const int total ← live_file_size(path)
     var tensor.Tensor embed ← tensor.default()
     var tensor.Tensor norm_s ← tensor.default()
-    embed ← live_load_one(config.model, total, admitted, "model.embed_tokens", 0)
-    norm_s ← live_load_one(config.model, total, admitted, "model.norm", 0)
+    embed ← live_load_one(path, total, admitted, "model.embed_tokens", 0)
+    norm_s ← live_load_one(path, total, admitted, "model.norm", 0)
 
     const list<string> families ← [
         "model.layers.input_layernorm",
@@ -1316,11 +1324,11 @@ fn live_run(ServeConfig config) → void {
         var list<tensor.Tensor> row ← []
         var int f ← 0
         while f < families.length() {
-            row.append(live_load_one(config.model, total, admitted, families.get(f) coalesce "", stratum))
+            row.append(live_load_one(path, total, admitted, families.get(f) coalesce "", stratum))
             f ← f + 1
         }
         strata.append(row)
-        stderr_write("inferentia live: loaded layer " + (stratum ↦ string) + "\n")
+        stderr_write("inferentia: loaded layer " + (stratum ↦ string) + "\n")
         stratum ← stratum + 1
     }
 
@@ -1363,13 +1371,74 @@ fn live_run(ServeConfig config) → void {
         panic "kv structure failed: " + kv.message(err)
     }
 
+    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+    return ResidentModel {
+        ready = true,
+        engine = engine,
+        embed = embed,
+        norm_s = norm_s,
+        strata = strata,
+        structure = structure,
+        manifest = admitted
+    }
+}
+
+fn load_resident_model(string path, string sha) → ResidentModel {
+    const manifestum.GgufManifest admitted ← inspect_model(path, sha)
+    return load_resident_weights(path, admitted)
+}
+
+fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, generatio.StopPolicy stop) → list<int> ⇥ generatio.GeneratioError {
+    const generatio.GenerationConfig g ← to_generation_config(cfg)
     var list<kv.KVCache> layers ← []
+    if model.ready {
+        layers ← fresh_resident_caches(model)
+    }
+    return generatio.generate_dense_with_stop(
+        g,
+        ids,
+        model.engine,
+        (string n, int s) → dense.Lookup ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
+        layers,
+        decode.fresh_cancellation(),
+        stop
+    )
+}
+
+fn live_run(ServeConfig config) → void {
+    stdout_write("inferentia live: admit + G3 tokenizer + generate_dense\n")
+    stdout_write("model.path=" + config.model + "\n")
+
+    var string sha ← ""
     do {
-        layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
+        sha ← admit_model(config.model)
     }
     catch err {
-        panic "empty caches failed: " + dense.message(err)
+        panic "admit failed: " + gguf.message(err)
     }
+    stdout_write("admit.sha256=" + sha + "\n")
+    if sha ≠ pinned_digest() {
+        panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
+    }
+
+    const int total ← live_file_size(config.model)
+    stdout_write("model.bytes=" + (total ↦ string) + "\n")
+
+    const manifestum.GgufManifest admitted ← inspect_model(config.model, sha)
+    stdout_write("manifest.data_offset=" + (admitted.data_inceptum ↦ string) + "\n")
+
+    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
+    stdout_write("tokenizer.vocab=" + (tok.multitudo ↦ string) + "\n")
+
+    const list<int> prompt_ids ← live_tokenize(tok, frozen_prompt_text())
+    stdout_write("prompt.ids=" + live_ids_text(prompt_ids) + "\n")
+    stdout_write("prompt.golden=" + live_ids_text(frozen_prompt_ids()) + "\n")
+    if live_first_divergence(prompt_ids, frozen_prompt_ids()) ≠ "none" {
+        panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
+    }
+
+    const ResidentModel model ← load_resident_weights(config.model, admitted)
+    const list<kv.KVCache> layers ← fresh_resident_caches(model)
     stdout_write("cache.layers=" + (layers.length() ↦ string) + "\n")
 
     var generatio.GenerationConfig gen ← generatio.default()
@@ -1379,15 +1448,14 @@ fn live_run(ServeConfig config) → void {
     catch err {
         panic "generation config failed: " + generatio.message(err)
     }
-    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
 
     var list<int> generated ← []
     do {
         generated ← generatio.generate_dense(
             gen,
             prompt_ids,
-            engine,
-            (string n, int s) → dense.Lookup ∴ live_lookup(n, s, embed, norm_s, strata),
+            model.engine,
+            (string n, int s) → dense.Lookup ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
             layers,
             decode.fresh_cancellation()
         )
@@ -1637,7 +1705,7 @@ fn handle_model(map<string, value> tab, ServerState st, ServeConfig config, stri
 # pinned EOG stop set and the max_tokens budget) → response assembly.
 # Domain validation (the gradus reject rows) is enforced by the engine with
 # typed causes; this unit maps them to 400/500.
-fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, string id) → void {
+fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, ResidentModel model, string id) → void {
     # Method gate: /generate is POST (D3).
     const value vm ← tab.get("method")
     const string method ← vm ↦ string
@@ -1681,7 +1749,7 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
     do {
-        const list<int> tokens ← run_generate(cfg, enc.ids)
+        const list<int> tokens ← run_generate(cfg, enc.ids, model, generatio.eog_stop())
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             http_respond(id, 503, error_body("generation cancelled (shutdown)"))
@@ -1698,7 +1766,7 @@ fn handle_generate(map<string, value> tab, ServerState st, ServeConfig config, s
 
 # Respond to one request carrier. /health is always 200 once the listener is
 # up; /generate is the U4 endpoint; any other path is 404 (D3).
-fn handle_request(value request, ServerState st, ServeConfig config) → void {
+fn handle_request(value request, ServerState st, ServeConfig config, ResidentModel model) → void {
     if request is map<string, value> {
         const map<string, value> tab ← request ↦ map<string, value>
         const value vid ← tab.get("id")
@@ -1710,7 +1778,7 @@ fn handle_request(value request, ServerState st, ServeConfig config) → void {
         } elif path ≡ "/model" {
             handle_model(tab, st, config, id)
         } elif path ≡ "/generate" {
-            handle_generate(tab, st, config, id)
+            handle_generate(tab, st, config, model, id)
         } else {
             http_respond(id, 404, "not found")
         }
@@ -1749,12 +1817,13 @@ fn serve(ServeConfig config) → void {
         stderr_write("inferentia: admission failed: " + cause + "\n")
     }
 
-    # U4 generation readiness: load the weights exactly once (the binding's
-    # oracle is a process-wide OnceLock — the resident-model semantics) and
-    # prove the engine can decode before serving. The single load is recorded
-    # on stderr; every /generate reuses the resident model (no reload). A
-    # failed warm-up is an admission/load failure (D5 → exit 2 at shutdown).
+    # U4 generation readiness: load the dense weights exactly once and prove
+    # generate_dense_with_stop (eog_stop) can decode before serving. Every
+    # /generate reuses the resident model (fresh KV caches per request). A
+    # failed load or warm-up is an admission/load failure (D5 → exit 2).
+    var ResidentModel resident ← empty_resident()
     if state.state ≡ "ready" {
+        resident ← load_resident_model(state.model_path, state.sha256)
         do {
             const GenerateConfig warmup_cfg ← GenerateConfig {
                 contextus = model_context_limit(),
@@ -1767,7 +1836,7 @@ fn serve(ServeConfig config) → void {
                 min_p = 0.0,
                 poena_repetitionis = 1.0
             }
-            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids())
+            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids(), resident, generatio.eog_stop())
             const int n ← warmup_tokens.length()
             if n < 1 {
                 state ← failed(state, "generation readiness: warm-up produced no tokens")
@@ -1787,7 +1856,7 @@ fn serve(ServeConfig config) → void {
     while serving {
         do {
             const value request ← http_accept(listener)
-            handle_request(request, state, config)
+            handle_request(request, state, config, resident)
         }
         catch err {
             # A request-level reject (oversize body, malformed request) must
