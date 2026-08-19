@@ -932,10 +932,27 @@ fn bytes_as_u8(bytes raw) → list<int<u8>> {
     return out
 }
 
+# Host IO payloads are String. A ⇥ string wrapper lets them propagate
+# instead of aborting; admit_model's cape maps them into CapsulaMala.
+fn host_digestio(string path) → string ⇥ string {
+    return call 'solum:digestio' (path) ↦ string
+}
+
+fn host_hauri(string path) → bytes ⇥ string {
+    return call 'solum:hauri' (path) ↦ bytes
+}
+
 # Path → host digest + bytes → gradus admit. Returns the carried digest.
 fn admit_model(string path) → string ⇥ gguf.GgufError {
-    const string digest ← call 'solum:digestio' (path) ↦ string
-    const bytes raw ← call 'solum:hauri' (path) ↦ bytes
+    var string digest ← ""
+    var bytes raw ← ||
+    do {
+        digest ← host_digestio(path)
+        raw ← host_hauri(path)
+    }
+    catch err {
+        throw variant CapsulaMala { message = err }
+    }
     const list<int<u8>> data ← bytes_as_u8(raw)
     const capsula.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
     return cap.digest()
