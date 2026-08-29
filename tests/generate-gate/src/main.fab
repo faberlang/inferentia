@@ -525,7 +525,7 @@ fn expect_reject_wire(string wire, string needle) → void {
     var string raise_error ← ""
     do {
         const generatio.GenerationConfig g ← generatio.deserialize_generation(wire)
-        fail("expected wire rejection containing '" + needle + "' but deserialize returned context " + (g.context() ↦ string))
+        fail("expected wire rejection containing '" + needle + "' but deserialize returned context " + (g.context ↦ string))
     }
     catch err {
         raise_error ← generatio.message(err)
