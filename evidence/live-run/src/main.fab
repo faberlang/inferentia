@@ -6,22 +6,26 @@ locale = "en"
 # Admit the pinned SmolLM2 GGUF via manifestum.inspect (the generate_dense
 # admission surface), load G3 tokenizer tables with tokenizator.build,
 # tokenize the frozen prompt, materialize dense weights, and call
-# generatio.generate_dense for 16 tokens against the U5 golden.
+# dense_gen.generate_dense for 16 tokens against the U5 golden.
 #
 # generate_dense applies EOG-stop {0, 2}. G2's own oracle is [30, 2].
 # The inferentia U5 golden is the 16-token llama.cpp / record.json prefix.
 
-import from "gradus:attention" attention
-import from "gradus:cache" kv
+import from "gradus:attention/rope" rope
+import from "gradus:cache/kv" kv
+import from "gradus:cache/structure" structure
 import from "gradus:decode" decode
-import from "gradus:generation" generatio
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
 import from "gradus:model/dense" dense
 import from "gradus:model/gguf_manifest" manifestum
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
-import from "gradus:tokenizer" tokenizator
+import from "gradus:tokenizer/bpe" tokenizator
+import from "gradus:tokenizer/identity" identity
 import from "norma:processus" processus
 import from "norma:solum" solum
 
@@ -487,12 +491,12 @@ main {
         stratum ← stratum + 1
     }
 
-    var attention.RopeConfig rope ← attention.default()
+    var rope.RopeConfig rope_cfg ← rope.default()
     do {
-        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        rope_cfg ← rope.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, rope.consecutive_policy())
     }
     catch err {
-        panic "rope config failed: " + attention.message(err)
+        panic "rope config failed: " + err.message
     }
 
     const dense.DenseConfig cfg ← dense.DenseConfig {
@@ -505,48 +509,48 @@ main {
         tied = true
     }
 
-    var kv.KVStructure structure ← kv.default_kv_structure()
+    var structure.KVStructure kv_structure ← structure.default_kv_structure()
     do {
-        const kv.LayerSet set ← kv.construct_layer_set(_indices(32), kv.dense_structure(), 5, 64)
-        var list<kv.LayerSet> sets ← vacua
+        const structure.LayerSet set ← structure.construct_layer_set(_indices(32), structure.dense_structure(), 5, 64)
+        var list<structure.LayerSet> sets ← vacua
         sets.append(set)
-        structure ← kv.construct_kv_structure(
+        kv_structure ← structure.construct_kv_structure(
             sets,
-            kv.kv_dtype_f32(),
-            kv.kv_dtype_f32(),
-            kv.v_layout_transposed(),
-            kv.sharing_gqa(),
-            kv.attention_classic(),
+            structure.kv_dtype_f32(),
+            structure.kv_dtype_f32(),
+            structure.v_layout_transposed(),
+            structure.sharing_gqa(),
+            structure.attention_classic(),
             15,
             8192,
             8192
         )
     }
     catch err {
-        panic "kv structure failed: " + kv.message(err)
+        panic "kv structure failed: " + err.message
     }
 
     var list<kv.KVCache> layers ← vacua
     do {
-        layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
+        layers ← dense.empty_caches(kv_structure, "smollm2", "360m", "f32-staged", "smollm")
     }
     catch err {
         panic "empty caches failed: " + dense.message(err)
     }
     print "cache layers=" + (layers.length() ↦ string) + " dim=" + (((layers.get(0) coalesce kv.default()).dimension()) ↦ string)
 
-    var generatio.GenerationConfig gen ← generatio.default()
+    var config.GenerationConfig gen ← config.default()
     do {
-        gen ← generatio.construct_generation(8192, 1, GENERATE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+        gen ← config.construct_generation(8192, 1, GENERATE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
     }
     catch err {
-        panic "generation config failed: " + generatio.message(err)
+        panic "generation config failed: " + err.message
     }
-    const generatio.DenseEngine engine ← generatio.construct_dense_engine(cfg, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+    const dense_gen.DenseEngine engine ← dense_gen.construct_dense_engine(cfg, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope_cfg)
 
     var list<int> generated ← vacua
     do {
-        generated ← generatio.generate_dense(
+        generated ← dense_gen.generate_dense(
             gen,
             prompt_ids,
             engine,
@@ -556,7 +560,7 @@ main {
         )
     }
     catch err {
-        panic "generate_dense failed: " + generatio.message(err)
+        panic "generate_dense failed: " + err.message
     }
 
     const int first ← generated.get(0) coalesce (0 - 1)
@@ -571,7 +575,7 @@ main {
     print "observed.n=" + (generated.length() ↦ string)
     print "token_match_count=" + (matches ↦ string)
     print "eog_token=" + (EOG_SMOLLM2 ↦ string)
-    print "eog_stop=" + ((generated.length() ≺ GENERATE and tokenizator.est_eog(last_tok)) ↦ string)
+    print "eog_stop=" + ((generated.length() ≺ GENERATE and identity.is_eog(last_tok)) ↦ string)
     print "g2_eog_oracle=[30, 2]"
     print "g1_unrestrained=[30, 2, 198]"
     print "first_divergence=" + divergence

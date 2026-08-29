@@ -18,10 +18,13 @@
 #   sha256 2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
 # Usage: generate-gate [model-path]
 
-import from "gradus:attention" attention
-import from "gradus:cache" kv
+import from "gradus:attention/rope" rope
+import from "gradus:cache/kv" kv
+import from "gradus:cache/structure" structure
 import from "gradus:decode" decode
-import from "gradus:generation" generatio
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
 import from "gradus:model/dense" dense
 import from "gradus:model/gguf_manifest" manifestum
@@ -101,28 +104,28 @@ fn frozen_config(int max_tokens) → GenerateConfig {
     }
 }
 
-fn to_generation(GenerateConfig cfg) → generatio.GenerationConfig ⇥ generatio.GeneratioError {
-    return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
+fn to_generation(GenerateConfig cfg) → config.GenerationConfig ⇥ config.GenerationError {
+    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
 }
 
 # --- Resident dense model --------------------------------------------------
 class ResidentModel {
     bool ready
-    generatio.DenseEngine engine
+    dense_gen.DenseEngine engine
     tensor.Tensor embed
     tensor.Tensor norm_s
     list<list<tensor.Tensor>> strata
-    kv.KVStructure structure
+    structure.KVStructure structure
 }
 
 fn empty_resident() → ResidentModel {
     return ResidentModel {
         ready = false,
-        engine = generatio.default_dense_engine(),
+        engine = dense_gen.default_dense_engine(),
         embed = tensor.default(),
         norm_s = tensor.default(),
         strata = [],
-        structure = kv.default_kv_structure()
+        structure = structure.default_kv_structure()
     }
 }
 
@@ -420,12 +423,12 @@ fn load_resident(string path) → ResidentModel {
         stratum ← stratum + 1
     }
 
-    var attention.RopeConfig rope ← attention.default()
+    var rope.RopeConfig rope_cfg ← rope.default()
     do {
-        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        rope_cfg ← rope.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, rope.consecutive_policy())
     }
     catch err {
-        panic "rope config failed: " + attention.message(err)
+        panic "rope config failed: " + err.message
     }
 
     const dense.DenseConfig architecture ← dense.DenseConfig {
@@ -438,35 +441,35 @@ fn load_resident(string path) → ResidentModel {
         tied = true
     }
 
-    var kv.KVStructure structure ← kv.default_kv_structure()
+    var structure.KVStructure kv_structure ← structure.default_kv_structure()
     do {
-        const kv.LayerSet set ← kv.construct_layer_set(indices(32), kv.dense_structure(), 5, 64)
-        var list<kv.LayerSet> sets ← []
+        const structure.LayerSet set ← structure.construct_layer_set(indices(32), structure.dense_structure(), 5, 64)
+        var list<structure.LayerSet> sets ← []
         sets.append(set)
-        structure ← kv.construct_kv_structure(
+        kv_structure ← structure.construct_kv_structure(
             sets,
-            kv.kv_dtype_f32(),
-            kv.kv_dtype_f32(),
-            kv.v_layout_transposed(),
-            kv.sharing_gqa(),
-            kv.attention_classic(),
+            structure.kv_dtype_f32(),
+            structure.kv_dtype_f32(),
+            structure.v_layout_transposed(),
+            structure.sharing_gqa(),
+            structure.attention_classic(),
             15,
             8192,
             8192
         )
     }
     catch err {
-        panic "kv structure failed: " + kv.message(err)
+        panic "kv structure failed: " + err.message
     }
 
-    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+    const dense_gen.DenseEngine engine ← dense_gen.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope_cfg)
     return ResidentModel {
         ready = true,
         engine = engine,
         embed = embed,
         norm_s = norm_s,
         strata = strata,
-        structure = structure
+        structure = kv_structure
     }
 }
 
@@ -479,13 +482,13 @@ fn fresh_caches(ResidentModel model) → list<kv.KVCache> {
     }
 }
 
-fn run_generate(GenerateConfig cfg, list<int> prompt, ResidentModel model, generatio.StopPolicy stop) → list<int> ⇥ generatio.GeneratioError {
-    const generatio.GenerationConfig g ← to_generation(cfg)
+fn run_generate(GenerateConfig cfg, list<int> prompt, ResidentModel model, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    const config.GenerationConfig g ← to_generation(cfg)
     var list<kv.KVCache> layers ← []
     if model.ready {
         layers ← fresh_caches(model)
     }
-    return generatio.generate_dense_with_stop(
+    return dense_gen.generate_dense_with_stop(
         g,
         prompt,
         model.engine,
@@ -502,12 +505,12 @@ fn expect_reject(GenerateConfig cfg, list<int> prompt, string needle) → void {
     var bool raised ← false
     var string raise_error ← ""
     do {
-        const list<int> tokens ← run_generate(cfg, prompt, empty_resident(), generatio.eog_stop())
+        const list<int> tokens ← run_generate(cfg, prompt, empty_resident(), decoder.eog_stop())
         unexpected_count ← tokens.length()
     }
     catch err {
         raised ← true
-        raise_error ← generatio.message(err)
+        raise_error ← err.message
     }
     if not raised {
         fail("expected rejection containing '" + needle + "' but generate returned " + (unexpected_count ↦ string) + " tokens")
@@ -524,11 +527,11 @@ fn expect_reject(GenerateConfig cfg, list<int> prompt, string needle) → void {
 fn expect_reject_wire(string wire, string needle) → void {
     var string raise_error ← ""
     do {
-        const generatio.GenerationConfig g ← generatio.deserialize_generation(wire)
+        const config.GenerationConfig g ← config.deserialize_generation(wire)
         fail("expected wire rejection containing '" + needle + "' but deserialize returned context " + (g.context ↦ string))
     }
     catch err {
-        raise_error ← generatio.message(err)
+        raise_error ← err.message
     }
     const string pass_line ← "PASS reject: " + needle
     const string fail_line ← "rejection for '" + needle + "' got: "
@@ -575,7 +578,7 @@ fn expect_p10_tokenization() → void {
     }
 }
 
-fn expect_sequence(GenerateConfig cfg, list<int> prompt, ResidentModel model, generatio.StopPolicy stop, list<int> expected, string label) → void {
+fn expect_sequence(GenerateConfig cfg, list<int> prompt, ResidentModel model, decoder.StopPolicy stop, list<int> expected, string label) → void {
     var list<int> actual ← []
     var bool raised ← false
     var string raise_error ← ""
@@ -585,7 +588,7 @@ fn expect_sequence(GenerateConfig cfg, list<int> prompt, ResidentModel model, ge
     }
     catch err {
         raised ← true
-        raise_error ← generatio.message(err)
+        raise_error ← err.message
     }
     if raised {
         fail(label + " raised: " + raise_error)
@@ -626,18 +629,18 @@ main args argv {
 
     const ResidentModel model ← load_resident(via)
 
-    expect_sequence(frozen_config(16), pinned_prompt(), model, generatio.eog_stop(), default_eog_tokens(), "default eog_stop == [30, 2]")
+    expect_sequence(frozen_config(16), pinned_prompt(), model, decoder.eog_stop(), default_eog_tokens(), "default eog_stop == [30, 2]")
 
     var list<int> r2 ← []
     var bool r2_raised ← false
     var string r2_error ← ""
     do {
-        const list<int> tokens ← run_generate(frozen_config(16), pinned_prompt(), model, generatio.eog_stop())
+        const list<int> tokens ← run_generate(frozen_config(16), pinned_prompt(), model, decoder.eog_stop())
         r2 ← tokens
     }
     catch err {
         r2_raised ← true
-        r2_error ← generatio.message(err)
+        r2_error ← err.message
     }
     if r2_raised {
         fail("request2 raised: " + r2_error)
@@ -648,7 +651,7 @@ main args argv {
         fail("request2 tokens differ from default EOG-stop (resident-model violation)")
     }
 
-    expect_sequence(frozen_config(16), pinned_prompt(), model, generatio.ignore_eos(), record_prefix_16(), "ignore_eos == record.json prefix")
+    expect_sequence(frozen_config(16), pinned_prompt(), model, decoder.ignore_eos(), record_prefix_16(), "ignore_eos == record.json prefix")
 
     stdout_write("GENERATE GATE ALL PASS\n")
 }

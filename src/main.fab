@@ -31,7 +31,7 @@
 # I-live: `inferentia live --model <PATH>` admits the GGUF through
 # `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
 # materializes the SmolLM2 dense weights, and calls
-# `generatio.generate_dense` for 16 tokens against the U5 golden.
+# `dense_gen.generate_dense` for 16 tokens against the U5 golden.
 #
 # HTTP serving goes through `norma:http/server` (bind / accept / reply /
 # open_sse). Request bodies arrive as valor octeti; `value ↦ bytes` then
@@ -48,10 +48,13 @@ import from "norma:http/request" httpreq
 import from "norma:http/server" server
 import from "norma:http/sse" sse
 
-import from "gradus:attention" attention
-import from "gradus:cache" kv
+import from "gradus:attention/rope" rope
+import from "gradus:cache/kv" kv
+import from "gradus:cache/structure" structure
 import from "gradus:decode" decode
-import from "gradus:generation" generatio
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
 import from "gradus:model/capsule" capsula
 import from "gradus:model/dense" dense
@@ -60,7 +63,8 @@ import from "gradus:model/gguf_manifest" manifestum
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
-import from "gradus:tokenizer" tokenizator
+import from "gradus:tokenizer/bpe" tokenizator
+import from "gradus:tokenizer/identity" identity
 
 # ---------------------------------------------------------------------------
 # Serve configuration (D1 syntax + D2 precedence)
@@ -958,18 +962,18 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     return cap.digest()
 }
 
-fn to_generation_config(GenerateConfig cfg) → generatio.GenerationConfig ⇥ generatio.GeneratioError {
-    return generatio.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
+fn to_generation_config(GenerateConfig cfg) → config.GenerationConfig ⇥ config.GenerationError {
+    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
 }
 
 # Resident dense weights for /generate (loaded once after admit).
 class ResidentModel {
     bool ready
-    generatio.DenseEngine engine
+    dense_gen.DenseEngine engine
     tensor.Tensor embed
     tensor.Tensor norm_s
     list<list<tensor.Tensor>> strata
-    kv.KVStructure structure
+    structure.KVStructure structure
     manifestum.GgufManifest manifest
 }
 
@@ -988,11 +992,11 @@ fn empty_manifest() → manifestum.GgufManifest {
 fn empty_resident() → ResidentModel {
     return ResidentModel {
         ready = false,
-        engine = generatio.default_dense_engine(),
+        engine = dense_gen.default_dense_engine(),
         embed = tensor.default(),
         norm_s = tensor.default(),
         strata = [],
-        structure = kv.default_kv_structure(),
+        structure = structure.default_kv_structure(),
         manifest = empty_manifest()
     }
 }
@@ -1389,12 +1393,12 @@ fn load_resident_weights(string path, manifestum.GgufManifest admitted) → Resi
         stratum ← stratum + 1
     }
 
-    var attention.RopeConfig rope ← attention.default()
+    var rope.RopeConfig rope_cfg ← rope.default()
     do {
-        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        rope_cfg ← rope.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, rope.consecutive_policy())
     }
     catch err {
-        panic "rope config failed: " + attention.message(err)
+        panic "rope config failed: " + err.message
     }
 
     const dense.DenseConfig architecture ← dense.DenseConfig {
@@ -1407,35 +1411,35 @@ fn load_resident_weights(string path, manifestum.GgufManifest admitted) → Resi
         tied = true
     }
 
-    var kv.KVStructure structure ← kv.default_kv_structure()
+    var structure.KVStructure kv_structure ← structure.default_kv_structure()
     do {
-        const kv.LayerSet set ← kv.construct_layer_set(live_indices(32), kv.dense_structure(), 5, 64)
-        var list<kv.LayerSet> sets ← []
+        const structure.LayerSet set ← structure.construct_layer_set(live_indices(32), structure.dense_structure(), 5, 64)
+        var list<structure.LayerSet> sets ← []
         sets.append(set)
-        structure ← kv.construct_kv_structure(
+        kv_structure ← structure.construct_kv_structure(
             sets,
-            kv.kv_dtype_f32(),
-            kv.kv_dtype_f32(),
-            kv.v_layout_transposed(),
-            kv.sharing_gqa(),
-            kv.attention_classic(),
+            structure.kv_dtype_f32(),
+            structure.kv_dtype_f32(),
+            structure.v_layout_transposed(),
+            structure.sharing_gqa(),
+            structure.attention_classic(),
             15,
             8192,
             8192
         )
     }
     catch err {
-        panic "kv structure failed: " + kv.message(err)
+        panic "kv structure failed: " + err.message
     }
 
-    const generatio.DenseEngine engine ← generatio.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope)
+    const dense_gen.DenseEngine engine ← dense_gen.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope_cfg)
     return ResidentModel {
         ready = true,
         engine = engine,
         embed = embed,
         norm_s = norm_s,
         strata = strata,
-        structure = structure,
+        structure = kv_structure,
         manifest = admitted
     }
 }
@@ -1445,13 +1449,13 @@ fn load_resident_model(string path, string sha) → ResidentModel {
     return load_resident_weights(path, admitted)
 }
 
-fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, generatio.StopPolicy stop) → list<int> ⇥ generatio.GeneratioError {
-    const generatio.GenerationConfig g ← to_generation_config(cfg)
+fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    const config.GenerationConfig g ← to_generation_config(cfg)
     var list<kv.KVCache> layers ← []
     if model.ready {
         layers ← fresh_resident_caches(model)
     }
-    return generatio.generate_dense_with_stop(
+    return dense_gen.generate_dense_with_stop(
         g,
         ids,
         model.engine,
@@ -1498,17 +1502,17 @@ fn live_run(ServeConfig config) → void {
     const list<kv.KVCache> layers ← fresh_resident_caches(model)
     stdout_write("cache.layers=" + (layers.length() ↦ string) + "\n")
 
-    var generatio.GenerationConfig gen ← generatio.default()
+    var config.GenerationConfig gen ← config.default()
     do {
-        gen ← generatio.construct_generation(8192, 1, 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+        gen ← config.construct_generation(8192, 1, 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
     }
     catch err {
-        panic "generation config failed: " + generatio.message(err)
+        panic "generation config failed: " + err.message
     }
 
     var list<int> generated ← []
     do {
-        generated ← generatio.generate_dense(
+        generated ← dense_gen.generate_dense(
             gen,
             prompt_ids,
             model.engine,
@@ -1518,7 +1522,7 @@ fn live_run(ServeConfig config) → void {
         )
     }
     catch err {
-        panic "generate_dense failed: " + generatio.message(err)
+        panic "generate_dense failed: " + err.message
     }
 
     const list<int> golden ← golden_tokens_16()
@@ -1802,7 +1806,7 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
     do {
-        const list<int> tokens ← run_generate(cfg, enc.ids, model, generatio.eog_stop())
+        const list<int> tokens ← run_generate(cfg, enc.ids, model, decoder.eog_stop())
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
@@ -1813,7 +1817,7 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
         }
     }
     catch err {
-        const string cause ← generatio.message(err)
+        const string cause ← err.message
         const int code ← classify_generate_error(cause)
         reply_json(incoming, code, error_body(cause))
     }
@@ -1888,7 +1892,7 @@ fn serve(ServeConfig config) → void {
                 min_p = 0.0,
                 poena_repetitionis = 1.0
             }
-            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids(), resident, generatio.eog_stop())
+            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids(), resident, decoder.eog_stop())
             const int n ← warmup_tokens.length()
             if n < 1 {
                 state ← failed(state, "generation readiness: warm-up produced no tokens")
@@ -1898,7 +1902,7 @@ fn serve(ServeConfig config) → void {
             }
         }
         catch err {
-            const string cause ← generatio.message(err)
+            const string cause ← err.message
             state ← failed(state, "generation readiness failed: " + cause)
             stderr_write("inferentia: generation readiness failed: " + cause + "\n")
         }
