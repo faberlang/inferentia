@@ -27,10 +27,11 @@ import from "gradus:generation/decoder" decoder
 import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
 import from "gradus:model/dense" dense
-import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/gguf_manifest" gguf_manifest
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
+import from "gradus:tokenizer/bpe" tokenizator
 import from "norma:solum" solum
 
 # --- I/O + exit ------------------------------------------------------------
@@ -104,8 +105,8 @@ fn frozen_config(int max_tokens) → GenerateConfig {
     }
 }
 
-fn to_generation(GenerateConfig cfg) → config.GenerationConfig ⇥ config.GenerationError {
-    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32)
+fn to_generation(GenerateConfig cfg, list<int> eog_ids) → config.GenerationConfig ⇥ config.GenerationError {
+    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32, eog_ids)
 }
 
 # --- Resident dense model --------------------------------------------------
@@ -116,6 +117,7 @@ class ResidentModel {
     tensor.Tensor norm_s
     list<list<tensor.Tensor>> strata
     structure.KVStructure structure
+    list<int> eog_ids
 }
 
 fn empty_resident() → ResidentModel {
@@ -125,7 +127,8 @@ fn empty_resident() → ResidentModel {
         embed = tensor.default(),
         norm_s = tensor.default(),
         strata = [],
-        structure = structure.default_kv_structure()
+        structure = structure.default_kv_structure(),
+        eog_ids = []
     }
 }
 
@@ -137,24 +140,24 @@ fn read_range(string path, int start, int length) → bytes {
     return solum.read_range(path, start, length)
 }
 
-fn source_range(string path, int total, int initium, int longitudo) → manifestum.SourceRead {
+fn source_range(string path, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
     if initium < 0 or longitudo < 0 or initium > total - longitudo {
-        return manifestum.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
+        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
     }
     const bytes raw ← read_range(path, initium, longitudo)
     if raw.length() ≠ longitudo {
-        return manifestum.SourceRead { successus = false, bytes = ||, message = "short range read" }
+        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "short range read" }
     }
-    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
 }
 
-fn prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.SourceRead {
+fn prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
     if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
-        return manifestum.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
+        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
     }
     const list<int> segment ← prefix.slice(initium, initium + longitudo)
     const bytes raw ← segment ↦ bytes
-    return manifestum.SourceRead { successus = true, bytes = raw, message = "" }
+    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
 }
 
 fn ends(string s, string tail) → bool {
@@ -177,10 +180,10 @@ fn slot(string nomen) → int {
 
 fn block_elements(tensor_view.TensorView v) → int {
     match v.layout {
-        case manifestum.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+        case gguf_manifest.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
             return elementa_per_blockum
         }
-        case manifestum.Ignota const typo {
+        case gguf_manifest.Ignota const typo {
             return 0
         }
     }
@@ -193,16 +196,16 @@ fn window(int remaining, int block) → int {
     return aligned
 }
 
-fn limits(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> {
+fn limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> {
     do {
-        return manifestum.limes_payloadis(m, gguf_name)
+        return gguf_manifest.limes_payloadis(m, gguf_name)
     }
     catch err {
-        panic "payload range failed for " + gguf_name + ": " + manifestum.message(err)
+        panic "payload range failed for " + gguf_name + ": " + gguf_manifest.message(err)
     }
 }
 
-fn bind_view(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView {
+fn bind_view(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView {
     do {
         return tensor_view.links(m, p)
     }
@@ -211,7 +214,7 @@ fn bind_view(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tens
     }
 }
 
-fn slice_view(tensor_view.TensorView v, int off, int n, (int, int) → manifestum.SourceRead fons) → list<f32> {
+fn slice_view(tensor_view.TensorView v, int off, int n, (int, int) → gguf_manifest.SourceRead fons) → list<f32> {
     do {
         return tensor_view.materialize_slice(v, off, n, fons)
     }
@@ -229,7 +232,7 @@ fn make_tensor(list<f32> datos, list<int> forma) → tensor.Tensor {
     }
 }
 
-fn materialize(string via, int total, manifestum.GgufManifest m, string gguf_name) → tensor.Tensor {
+fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.Tensor {
     const tuple<int, int> limes ← limits(m, gguf_name)
     const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
         name = gguf_name,
@@ -250,7 +253,7 @@ fn materialize(string via, int total, manifestum.GgufManifest m, string gguf_nam
             v,
             off,
             n,
-            (int initium, int longitudo) → manifestum.SourceRead ∴ source_range(via, total, initium, longitudo)
+            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ source_range(via, total, initium, longitudo)
         )
         var int pi ← 0
         while pi < part.length() {
@@ -313,7 +316,7 @@ fn linear_family(string family) → bool {
     return false
 }
 
-fn load_one(string via, int total, manifestum.GgufManifest m, string family, int stratum) → tensor.Tensor {
+fn load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.Tensor {
     const string name ← gguf_name(family, stratum)
     const tensor.Tensor stored ← materialize(via, total, m, name)
     if linear_family(family) {
@@ -351,7 +354,7 @@ fn indices(int n) → list<int> {
     return out
 }
 
-fn inspect_model(string path) → manifestum.GgufManifest {
+fn inspect_model(string path) → gguf_manifest.GgufManifest {
     const int total ← file_size(path)
     if total ≠ pinned_bytes() {
         panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (pinned_bytes() ↦ string)
@@ -368,7 +371,7 @@ fn inspect_model(string path) → manifestum.GgufManifest {
         digest = pinned_digest(),
         length = total
     }
-    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
+    var gguf_manifest.GgufManifest admitted ← gguf_manifest.GgufManifest {
         identitas = identitas,
         version = 0,
         concordatio = 0,
@@ -378,21 +381,29 @@ fn inspect_model(string path) → manifestum.GgufManifest {
         tensors = []
     }
     do {
-        admitted ← manifestum.inspect(
-            (int initium, int longitudo) → manifestum.SourceRead ∴ prefix_range(prefix, initium, longitudo),
+        admitted ← gguf_manifest.inspect(
+            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ prefix_range(prefix, initium, longitudo),
             total,
             identitas
         )
     }
     catch err {
-        panic "manifest admission failed: " + manifestum.message(err)
+        panic "manifest admission failed: " + gguf_manifest.message(err)
     }
     return admitted
 }
 
 fn load_resident(string path) → ResidentModel {
     const int total ← file_size(path)
-    const manifestum.GgufManifest admitted ← inspect_model(path)
+    const gguf_manifest.GgufManifest admitted ← inspect_model(path)
+    var list<int> eog_ids ← []
+    do {
+        const tokenizator.Tokenizer tokenizer ← tokenizator.build(admitted)
+        eog_ids ← tokenizator.artifact_eog(tokenizer)
+    }
+    catch err {
+        panic "tokenizer admission failed: " + tokenizator.message(err)
+    }
     var tensor.Tensor embed ← tensor.default()
     var tensor.Tensor norm_s ← tensor.default()
     embed ← load_one(path, total, admitted, "model.embed_tokens", 0)
@@ -469,7 +480,8 @@ fn load_resident(string path) → ResidentModel {
         embed = embed,
         norm_s = norm_s,
         strata = strata,
-        structure = kv_structure
+        structure = kv_structure,
+        eog_ids = eog_ids
     }
 }
 
@@ -483,7 +495,7 @@ fn fresh_caches(ResidentModel model) → list<kv.KVCache> {
 }
 
 fn run_generate(GenerateConfig cfg, list<int> prompt, ResidentModel model, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
-    const config.GenerationConfig g ← to_generation(cfg)
+    const config.GenerationConfig g ← to_generation(cfg, model.eog_ids)
     var list<kv.KVCache> layers ← []
     if model.ready {
         layers ← fresh_caches(model)

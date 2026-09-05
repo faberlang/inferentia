@@ -3,12 +3,13 @@ locale = "en"
 +++
 # Inferentia I-live — first live run on the gradus provider.
 #
-# Admit the pinned SmolLM2 GGUF via manifestum.inspect (the generate_dense
+# Admit the pinned SmolLM2 GGUF via gguf_manifest.inspect (the generate_dense
 # admission surface), load G3 tokenizer tables with tokenizator.build,
 # tokenize the frozen prompt, materialize dense weights, and call
 # dense_gen.generate_dense for 16 tokens against the U5 golden.
 #
-# generate_dense applies EOG-stop {0, 2}. G2's own oracle is [30, 2].
+# generate_dense applies EOG-stop using the admitted tokenizer metadata. G2's
+# pinned oracle on this row is [30, 2].
 # The inferentia U5 golden is the 16-token llama.cpp / record.json prefix.
 
 import from "gradus:attention/rope" rope
@@ -20,12 +21,11 @@ import from "gradus:generation/decoder" decoder
 import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
 import from "gradus:model/dense" dense
-import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/gguf_manifest" gguf_manifest
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
-import from "gradus:tokenizer/identity" identity
 import from "norma:processus" processus
 import from "norma:solum" solum
 
@@ -39,14 +39,13 @@ const list<int> GOLDEN_16 ← [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 481
 const int VOCAB ← 49152
 const int SLICE_CAP ← 16777216
 const int GENERATE ← 16
-const int EOG_SMOLLM2 ← 2
 
 union DecodeRunError {
-    ArgumentaMala { string message }
-    ManifestumMala { string message }
-    AdapterMala { string message }
-    VinculumMala { string message }
-    SlicemMala { string message }
+    ArgumentaMala { string message },
+    ManifestumMala { string message },
+    AdapterMala { string message },
+    VinculumMala { string message },
+    SlicemMala { string message },
     ForwardMala { string message }
 }
 
@@ -61,9 +60,9 @@ fn message(DecodeRunError e) → string {
     }
 }
 
-fn _range(string via, int total, int initium, int longitudo) → manifestum.SourceRead {
+fn _range(string via, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
     if initium < 0 or longitudo < 0 or initium > total - longitudo {
-        return manifestum.SourceRead {
+        return gguf_manifest.SourceRead {
             successus = false,
             bytes = ||,
             message = "range request exceeds the artifact"
@@ -71,18 +70,18 @@ fn _range(string via, int total, int initium, int longitudo) → manifestum.Sour
     }
     const bytes bytes ← solum.read_range(via, initium, longitudo)
     if bytes.length() ≠ longitudo {
-        return manifestum.SourceRead {
+        return gguf_manifest.SourceRead {
             successus = false,
             bytes = ||,
             message = "short range read"
         }
     }
-    return manifestum.SourceRead {successus = true, bytes = bytes, message = ""}
+    return gguf_manifest.SourceRead {successus = true, bytes = bytes, message = ""}
 }
 
-fn _prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.SourceRead {
+fn _prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
     if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
-        return manifestum.SourceRead {
+        return gguf_manifest.SourceRead {
             successus = false,
             bytes = ||,
             message = "inspection attempted to read the tensor data region"
@@ -90,7 +89,7 @@ fn _prefix_range(list<int> prefix, int initium, int longitudo) → manifestum.So
     }
     const list<int> segmentum ← prefix.slice(initium, initium + longitudo)
     const bytes bytes ← segmentum ↦ bytes
-    return manifestum.SourceRead {successus = true, bytes = bytes, message = ""}
+    return gguf_manifest.SourceRead {successus = true, bytes = bytes, message = ""}
 }
 
 fn _ends(string s, string tail) → bool {
@@ -126,10 +125,10 @@ fn _ids_text(list<int> ids) → string {
 
 fn _block_elements(tensor_view.TensorView v) → int {
     match v.layout {
-        case manifestum.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+        case gguf_manifest.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
             return elementa_per_blockum
         }
-        case manifestum.Ignota const typo {
+        case gguf_manifest.Ignota const typo {
             return 0
         }
     }
@@ -142,16 +141,16 @@ fn _window(int remaining, int block) → int {
     return aligned
 }
 
-fn _limits(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ DecodeRunError {
+fn _limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ DecodeRunError {
     do {
-        return manifestum.limes_payloadis(m, gguf_name)
+        return gguf_manifest.limes_payloadis(m, gguf_name)
     }
     catch err {
-        throw variant ManifestumMala {message = "payload range failed for " + gguf_name + ": " + manifestum.message(err)}
+        throw variant ManifestumMala {message = "payload range failed for " + gguf_name + ": " + gguf_manifest.message(err)}
     }
 }
 
-fn _bind(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ DecodeRunError {
+fn _bind(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ DecodeRunError {
     do {
         return tensor_view.links(m, p)
     }
@@ -164,7 +163,7 @@ fn _slice(
     tensor_view.TensorView v,
     int off,
     int n,
-    (int, int) → manifestum.SourceRead fons
+    (int, int) → gguf_manifest.SourceRead fons
 ) → list<f32> ⇥ DecodeRunError {
     do {
         return tensor_view.materialize_slice(v, off, n, fons)
@@ -186,7 +185,7 @@ fn _tensor(list<f32> datos, list<int> forma) → tensor.Tensor ⇥ DecodeRunErro
 fn _materialize(
     string via,
     int total,
-    manifestum.GgufManifest m,
+    gguf_manifest.GgufManifest m,
     string gguf_name
 ) → tensor.Tensor ⇥ DecodeRunError {
     const tuple<int, int> limes ← _limits(m, gguf_name)
@@ -209,7 +208,7 @@ fn _materialize(
             v,
             off,
             n,
-            (int initium, int longitudo) → manifestum.SourceRead ∴ _range(via, total, initium, longitudo)
+            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ _range(via, total, initium, longitudo)
         )
         for from part const x {
             datos.append(x)
@@ -273,7 +272,7 @@ fn _linear_family(string family) → bool {
 fn _load_one(
     string via,
     int total,
-    manifestum.GgufManifest m,
+    gguf_manifest.GgufManifest m,
     string family,
     int stratum
 ) → tensor.Tensor ⇥ DecodeRunError {
@@ -320,7 +319,7 @@ fn _indices(int n) → list<int> {
     return out
 }
 
-fn _build_tokenizer(manifestum.GgufManifest m) → tokenizator.Tokenizer {
+fn _build_tokenizer(gguf_manifest.GgufManifest m) → tokenizator.Tokenizer {
     do {
         return tokenizator.build(m)
     }
@@ -397,7 +396,7 @@ main {
 
     print "policy: inferentia I-live — admit + G3 tokenizer + generate_dense"
     print "oracle: U5 golden 16 = [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]"
-    print "g2_eog: generate_dense EOG-stop {0, 2} yields [30, 2] on this row (G1 unrestrained was [30, 2, 198])"
+    print "g2_eog: generate_dense EOG-stop uses the admitted tokenizer EOG set and yields [30, 2] on this row (G1 unrestrained was [30, 2, 198])"
     print "engine: compiled rust"
     print "model.path=" + via
 
@@ -419,7 +418,7 @@ main {
         length = total
     }
 
-    var manifestum.GgufManifest admitted ← manifestum.GgufManifest {
+    var gguf_manifest.GgufManifest admitted ← gguf_manifest.GgufManifest {
         identitas = identitas,
         version = 0,
         concordatio = 0,
@@ -429,19 +428,20 @@ main {
         tensors = vacua
     }
     do {
-        admitted ← manifestum.inspect(
-            (int initium, int longitudo) → manifestum.SourceRead ∴ _prefix_range(prefix, initium, longitudo),
+        admitted ← gguf_manifest.inspect(
+            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ _prefix_range(prefix, initium, longitudo),
             total,
             identitas
         )
     }
     catch err {
-        panic "manifest admission failed: " + manifestum.message(err)
+        panic "manifest admission failed: " + gguf_manifest.message(err)
     }
     print "admit.digest=" + digestio
     print "manifest.data_offset=" + (admitted.data_inceptum ↦ string)
 
     const tokenizator.Tokenizer tok ← _build_tokenizer(admitted)
+    const list<int> eog_ids ← tokenizator.artifact_eog(tok)
     print "tokenizer.vocab=" + (tok.multitudo ↦ string)
 
     const list<int> prompt_ids ← _tokenize(tok, "The quick brown fox jumps over the lazy dog")
@@ -541,7 +541,7 @@ main {
 
     var config.GenerationConfig gen ← config.default()
     do {
-        gen ← config.construct_generation(8192, 1, GENERATE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+        gen ← config.construct_generation(8192, 1, GENERATE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids)
     }
     catch err {
         panic "generation config failed: " + err.message
@@ -574,8 +574,9 @@ main {
     print "golden=" + _ids_text(GOLDEN_16)
     print "observed.n=" + (generated.length() ↦ string)
     print "token_match_count=" + (matches ↦ string)
-    print "eog_token=" + (EOG_SMOLLM2 ↦ string)
-    print "eog_stop=" + ((generated.length() ≺ GENERATE and identity.is_eog(last_tok)) ↦ string)
+    print "eog_ids=" + _ids_text(eog_ids)
+    print "eog_token=" + (last_tok ↦ string)
+    print "eog_stop=" + ((generated.length() ≺ GENERATE and tokenizator.is_artifact_eog(tok, last_tok)) ↦ string)
     print "g2_eog_oracle=[30, 2]"
     print "g1_unrestrained=[30, 2, 198]"
     print "first_divergence=" + divergence
