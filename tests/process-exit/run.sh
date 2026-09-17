@@ -72,7 +72,7 @@ else
         if [ "$STATUS" -eq 0 ]; then
             ok "clean shutdown exit 0 (observed $STATUS)"
         else
-            bad "clean shutdown expected 0, observed $STATUS (SIGTERM without the U6 signal route kills the process; loop-end exit delivery blocked on the scoped faber-runtime fix)"
+            bad "clean shutdown expected 0, observed $STATUS (SIGTERM without the U6 signal route kills the process; loop-end exit delivery not exercised until that trigger exists)"
         fi
     fi
 fi
