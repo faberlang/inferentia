@@ -1921,13 +1921,11 @@ fn serve(ServeConfig config) → void {
     # Loop-end shutdown path (reachable when the listener stops / accept is
     # cancelled). The D5 exit-code decision maps failed admission to exit 2
     # and successful admission / clean shutdown to exit 0; the code is
-    # DELIVERED to the process via the processus:exi primitive (exit_with),
-    # not printed-and-panicked. Note: the native-host runtime delivery of
-    # processus:exi was broken at the time of this commit (plan-time classifies
-    # it as a builtin route; the native-host dispatch shadows the builtin and
-    # rejects it — scoped as a faber-runtime fix in the u2p1 closeout), and
-    # the loop-end trigger (SIGTERM → http:stop) is the recorded U6 signal
-    # gap. The executable exit-code proof for the harness paths runs under
+    # DELIVERED to the process via the processus:exi primitive (exit_with).
+    # The loop-end trigger (SIGTERM → http:stop) is the recorded U6 signal
+    # gap: with no signal route wired, SIGTERM kills the process by signal
+    # (observed exit 143) and this loop-end path is not reached. The
+    # executable exit-code proof for the harness paths runs under
     # tests/admission-gate/ and tests/process-exit/.
     stderr_write("inferentia: shutting down (exit code " + (exit_code_for(state.state) ↦ string) + ")\n")
     exit_with(exit_code_for(state.state))

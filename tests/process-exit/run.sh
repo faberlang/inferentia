@@ -14,14 +14,11 @@
 # or the accept is cancelled; the delivery route is `processus:exi`
 # (`exit_with` in src/main.fab).
 #
-# STATUS AT THIS COMMIT: BLOCKED by two scoped toolchain gaps (see README):
-#   (1) faber-runtime native-host dispatch does not deliver `processus:exi`
-#       (plan-time classifies it as a builtin route; the installed NativeHost
-#       shadows the builtin and rejects the route; the rejection path then
-#       deadlocks). Scoped as the u2p1 runtime fix.
-#   (2) no loop-end trigger is wired: SIGTERM kills the process (status 143)
-#       because no signal handling exists (recorded U6 gap).
-# Until those land, the product-binary assertions report the ACTUAL statuses
+# STATUS AT THIS COMMIT: BLOCKED — no loop-end trigger is wired: SIGTERM
+#       kills the process (status 143) because no signal handling exists
+#       (recorded U6 gap). The serve-loop `processus:exi` exit delivery is
+#       not exercised until that trigger exists (see README).
+# Until it lands, the product-binary assertions report the ACTUAL statuses
 # as evidence (expected 0/2, observed 143) and exit 1.
 #
 # The admission path itself (real `gradus:model/gguf` admit on the pinned row) is proven

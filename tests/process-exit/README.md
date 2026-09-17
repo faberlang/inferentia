@@ -14,35 +14,23 @@ delivers the code. Before this unit the loop-end path only **printed** the
 intended code and **panicked** (exit 101); `exit_code_for` was computed and
 tested but never delivered. The panic was replaced by `exit_with`.
 
-## Status at this commit — BLOCKED (scoped)
+## Status at this commit — BLOCKED (U6 loop-end trigger)
 
-The product-binary assertions cannot pass yet. Two toolchain gaps, both
-scoped in the u2p1 closeout:
+The product-binary assertions cannot pass yet: the serve-loop end path —
+where `exit_with` delivers the D5 code through `processus:exi` — is never
+reached, because **no loop-end trigger is wired**. SIGTERM/SIGINT handling
+(`http:stop` after signal) is the recorded U6 gap ("the native host has
+no processus signal route"). Until it lands, SIGTERM kills the process by
+signal: expected 0 (clean shutdown) / 2 (failed admission), observed 143.
 
-1. **faber-runtime native-host dispatch does not deliver `processus:exi`.**
-   Faber's plan-time classification (`faber/src/package/dispatch.rs`
-   `is_builtin_ad_route`) treats `processus:exi` as a *builtin* route (no
-   native host required) — the no-host harness builds
-   (`tests/admission-gate`, `tests/generate-gate`) deliver real exit codes
-   0/2 through it. But `start_host_dispatch` (`faber-runtime/src/frame.rs`)
-   routes every non-`runtime:` route to the installed `NativeHost` when a
-   `[target.rust] host = "native"` product exists, and the native kernel
-   does not manifest `processus:exi` (host-providers processus manifest —
-   deliberately unmanifested). `NativeHost::start` rejects the route with
-   `host_unsupported_route`, and the rejection path **deadlocks**
-   (`responses.reject_start_error` re-locks the sermo mutex held by
-   `sermo_recv`). Net effect: `call 'processus:exi'` in a native product
-   hangs instead of exiting.
-   Fix scope: in `start_host_dispatch`, fall back to
-   `BuiltinRuntimeDispatch` for routes the installed host does not support
-   (or manifest `processus:exi` in host-providers processus), then rebuild
-   the core-support snapshot + faber binary.
-2. **No loop-end trigger is wired.** SIGTERM/SIGINT handling
-   (`http:stop` after signal) is the recorded U6 gap ("the native host has
-   no processus signal route"). Until then SIGTERM kills the process by
-   signal (observed `$?` = 143) and the loop-end path is unreachable.
+An earlier version of this section attributed the blocked exit delivery to
+a native-dispatch gap in the `faber-runtime` crate, fixed at a commit there.
+That repo no longer exists and the fix commit resolves in no faberlang repo
+(provider ruling 2615e6a9 remapped inferentia onto `gradus:*`). Whether the
+recomposed runtime delivers the loop-end `processus:exi` call is unverified
+until U6 provides the trigger — noted for the U6 owner.
 
-Until both land, `run.sh` reports the observed statuses as evidence and
+Until then, `run.sh` reports the observed statuses as evidence and
 exits 1. The **admission path itself** (real `gradus:model/gguf` admit on the pinned
 row → exit 0 / exit 2) is proven end-to-end by the harness under
 `tests/admission-gate/`.
