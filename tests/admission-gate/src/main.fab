@@ -26,7 +26,7 @@
 # fixtures.py and the full matrix (typed cause + exit 0/2 + listener
 # regression) is validated by run.sh in this directory.
 
-import from "gradus:model/capsule" capsula
+import from "gradus:model/capsule" capsule
 import from "gradus:model/gguf" gguf
 
 # The pinned row's verified whole-file SHA-256 (gi0-model-contract v1.0.0 §1;
@@ -80,7 +80,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
         throw variant CapsulaMala { message = err }
     }
     const list<int<u8>> data ← bytes_as_u8(raw)
-    const capsula.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
+    const capsule.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
     return cap.digest()
 }
 

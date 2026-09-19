@@ -36,11 +36,16 @@ truth. When they disagree, working code and observed behavior win.
 
 ## Validation
 
-Run the narrowest useful proof first:
+Run the narrowest useful proof first — the package imports `gradus:` and
+`norma:` providers, so compilation needs the container as
+`FABER_LIBRARY_HOME`, the workspace radix binary (the PATH `faber` lags main
+and fails package resolution with `PKG001`), and an absolute input path:
 
 ```sh
-faber check .
-faber build .
+CONTAINER="$(cd .. && pwd)"
+FABER_BIN="$CONTAINER/radix/target/debug/faber"
+FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" check "$(pwd)"
+FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" build "$(pwd)"
 ```
 
 Model-serving stages must record the exact model path, size, hash, GGUF

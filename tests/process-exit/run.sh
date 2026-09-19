@@ -45,7 +45,7 @@ bad()  { printf 'FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
 # --- Product binary: clean shutdown after successful admission -> exit 0 ---
 note "== product binary: clean shutdown (valid model) -> exit 0 =="
 if [ ! -x "$BIN" ]; then
-    note "BLOCKED: $BIN not built (run: faber build .)"
+    note "BLOCKED: $BIN not built (build at the repo root per README \"Current commands\")"
 else
     "$BIN" serve --model "$MODEL" --port "$PORT" \
         >"$ROOT/tests/process-exit/out-clean.log" 2>&1 &
@@ -80,7 +80,7 @@ fi
 # --- Product binary: failed admission -> exit 2 ---------------------------
 note "== product binary: failed admission -> exit 2 =="
 if [ ! -x "$BIN" ]; then
-    note "BLOCKED: $BIN not built (run: faber build .)"
+    note "BLOCKED: $BIN not built (build at the repo root per README \"Current commands\")"
 else
     "$BIN" serve --model "$ROOT/tests/process-exit/missing-model.gguf" --port "$PORT2" \
         >"$ROOT/tests/process-exit/out-failed.log" 2>&1 &

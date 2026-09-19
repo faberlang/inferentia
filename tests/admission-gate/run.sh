@@ -42,6 +42,19 @@ SERVER="$ROOT/target/debug/inferentia"
 MODEL="${1:-/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf}"
 PORT="${PORT:-18107}"
 
+# Compiler contract (see README "Current commands"): the package imports
+# `gradus:`/`norma:` providers, so the build needs the container as
+# FABER_LIBRARY_HOME and the workspace radix binary — the PATH `faber` lags
+# main and fails package resolution (PKG001).
+CONTAINER="$(cd "$ROOT/.." && pwd)"
+FABER_LIBRARY_HOME="${FABER_LIBRARY_HOME:-$CONTAINER}"
+export FABER_LIBRARY_HOME
+FABER_BIN="${FABER_BIN:-$CONTAINER/radix/target/debug/faber}"
+if [ ! -x "$FABER_BIN" ]; then
+    note "BLOCKED: workspace faber binary not found: $FABER_BIN (set FABER_BIN)"
+    exit 1
+fi
+
 PASS=0
 FAIL=0
 
@@ -51,9 +64,9 @@ bad()  { printf 'FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
 
 # --- Harness binary ---------------------------------------------------------
 if [ ! -x "$BIN" ]; then
-    note "== building admission-gate harness (faber build .) =="
-    (cd "$GATE" && faber build .) >/dev/null || {
-        note "BLOCKED: admission-gate harness build failed (faber build . from tests/admission-gate)"
+    note "== building admission-gate harness (workspace faber + FABER_LIBRARY_HOME) =="
+    (cd "$GATE" && "$FABER_BIN" build "$GATE") >/dev/null || {
+        note "BLOCKED: admission-gate harness build failed (workspace faber build $GATE; see README \"Current commands\")"
         exit 1
     }
 fi
@@ -102,7 +115,7 @@ fi
 note ""
 note "== listener regression: server still serves after admission failure =="
 if [ ! -x "$SERVER" ]; then
-    bad "server binary not built (run: faber build . at the repo root first)"
+    bad "server binary not built (build at the repo root per README \"Current commands\" first)"
 else
     MALFORMED="$(awk -F'\t' 'NR==1{print $1}' "$WORK/manifest.tsv")"
     "$SERVER" serve --model "$MALFORMED" --port "$PORT" \

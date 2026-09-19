@@ -38,7 +38,8 @@ row → exit 0 / exit 2) is proven end-to-end by the harness under
 ## Usage
 
 ```sh
-faber build .
+CONTAINER="$(cd ../.. && pwd)"
+FABER_LIBRARY_HOME="$CONTAINER" "$CONTAINER/radix/target/debug/faber" build "$(cd ../.. && pwd)"
 ./run.sh                # uses the pinned SmolLM2-360M row
 ./run.sh /path/to/model # explicit model
 ```

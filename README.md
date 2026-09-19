@@ -27,12 +27,21 @@ production dependency of Inferentia. Deployment is a separate work stream.
 
 ## Current commands
 
-From this repository:
+From this repository — the package imports `gradus:` and `norma:` providers,
+so compilation needs the faberlang container as `FABER_LIBRARY_HOME`, the
+workspace radix binary (the PATH `faber` lags main and fails package
+resolution with `PKG001`), and an absolute input path:
 
 ```sh
-faber check .
-faber build .
+CONTAINER="$(cd .. && pwd)"
+FABER_BIN="$CONTAINER/radix/target/debug/faber"
+FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" check "$(pwd)"
+FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" build "$(pwd)"
 ```
+
+In a `worktrees/<lane>/` packet the same form holds with the lane root as the
+container; if the lane's `radix/target/debug/faber` is not built, override
+`FABER_BIN` to a built workspace binary.
 
 The CLI has no serving command yet. See the
 [Inferentia master campaign](docs/factory/inferentia/CAMPAIGN.md) for the staged
