@@ -28,10 +28,13 @@
 # existence-checked in gradus docs/api-reference.md). Default stop is
 # `eog_stop()` (D4). This unit owns the request pipeline around it.
 #
-# I-live: `inferentia live --model <PATH>` admits the GGUF through
-# `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
-# materializes the SmolLM2 dense weights, and calls
-# `dense_gen.generate_dense` for 16 tokens against the U5 golden.
+# I-live: `inferentia live --model <PATH> [--prompt TEXT]` admits the GGUF
+# through `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
+# materializes the SmolLM2 dense weights, and one-shot generates the given
+# prompt (default: the frozen fixture) through `dense_gen.generate_dense_with_stop`,
+# printing `ids=` (space-joined) and the decoded `text=`. Default stop is
+# eog_stop (frozen oracle [30, 2]); --ignore-eos selects ignore_eos and the
+# 16-token U5 golden compare.
 #
 # HTTP serving goes through `norma:http/server` (bind / accept / reply /
 # open_sse). Request bodies arrive as valor octeti; `value ↦ bytes` then
@@ -82,6 +85,8 @@ class ServeConfig {
     int context
     int seed
     string log_level
+    string prompt
+    bool ignore_eos
 }
 
 # ---------------------------------------------------------------------------
@@ -705,6 +710,13 @@ fn effective_max_prompt(ServeConfig server) → int {
     return if_int(server.max_prompt ≡ 0, model_context_limit(), server.max_prompt)
 }
 
+# The effective live prompt: the --prompt text, or the frozen fixture when
+# unset (the parser rejects an empty --prompt, so "" is a safe sentinel).
+fn effective_prompt(ServeConfig server) → string {
+    if server.prompt ≠ "" { return server.prompt }
+    return frozen_prompt_text()
+}
+
 # D2 precedence: body fields override server flags, flags override defaults.
 # `magna_promptus` is the prompt-token admission bound, not a request batch:
 # the engine rejects any prompt longer than it with "prompt length exceeds
@@ -1065,12 +1077,13 @@ fn fresh_resident_caches(ResidentModel model) → list<kv.KVCache> {
 }
 
 # ---------------------------------------------------------------------------
-# I-live — one-shot G2 generate_dense on an admitted GGUF
+# I-live — one-shot G2 generate_dense_with_stop on an admitted GGUF
 #
 # Serve loads the same resident dense weights and calls
 # generate_dense_with_stop with an explicit StopPolicy (default eog_stop).
 # live is the composed provider run: admit → inspect → G3 tokenizer
-# tables → dense weights → generate_dense.
+# tables → dense weights → generate_dense_with_stop (eog_stop by default;
+# --ignore-eos selects ignore_eos and the 16-token golden compare).
 # ---------------------------------------------------------------------------
 
 fn pinned_digest() → string {
@@ -1085,9 +1098,18 @@ fn pinned_slice_cap() → int {
     return 16777216
 }
 
-# U5 / record.json generated_tokens[0..16] (i1-validation-u5).
+# U5 / record.json generated_tokens[0..16] (i1-validation-u5). The
+# **ignore_eos** continuation — the EOG id is sample-suppressed only under
+# ignore_eos (gradus decoder.fab:140-144), so this golden compares only
+# under --ignore-eos.
 fn golden_tokens_16() → list<int> {
     return [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
+}
+
+# The frozen fixture's greedy eog_stop continuation (generate-gate header
+# fact: the EOG id terminates the run, so the run is [30, 2]).
+fn frozen_eog_continuation() → list<int> {
+    return [30, 2]
 }
 
 fn live_file_size(string path) → int {
@@ -1146,6 +1168,18 @@ fn live_ids_text(list<int> ids) → string {
         i ← i + 1
     }
     return out + "]"
+}
+
+# Space-joined ids for the one-shot `ids=` line (recipes grep `^ids=30 2`).
+fn live_ids_flat(list<int> ids) → string {
+    var string out ← ""
+    var int i ← 0
+    while i < ids.length() {
+        if i > 0 { out ← out + " " }
+        out ← out + ((ids.get(i) coalesce 0) ↦ string)
+        i ← i + 1
+    }
+    return out
 }
 
 fn live_block_elements(tensor_view.TensorView v) → int {
@@ -1384,6 +1418,25 @@ fn live_tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
     }
 }
 
+# Generated ids → decoded text through the admitted tokenizer (`tokenizator.decode`).
+# A typed TokenizerError fails closed — no placeholder or partial text.
+# Straight-line catch arm for the BD-3 stepper constraint.
+fn live_decode(tokenizator.Tokenizer tok, list<int> tokens) → string {
+    do {
+        return tokenizator.decode(tok, tokens)
+    }
+    catch err {
+        panic "G3 decode failed: " + err.message
+    }
+}
+
+# The live stop policy: default eog_stop; --ignore-eos runs to the
+# --max-tokens ceiling (the 16-token golden's stop).
+fn live_stop_policy(bool ignore_eos) → decoder.StopPolicy {
+    if ignore_eos { return decoder.ignore_eos() }
+    return decoder.eog_stop()
+}
+
 fn inspect_model(string path, string sha) → gguf_manifest.GgufManifest {
     const int total ← live_file_size(path)
     if total ≠ model_file_size_bytes() {
@@ -1549,11 +1602,14 @@ fn live_run(ServeConfig serve_config) → void {
     const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
     stdout_write("tokenizer.vocab=" + (tok.multitudo ↦ string) + "\n")
 
-    const list<int> prompt_ids ← live_tokenize(tok, frozen_prompt_text())
+    const string prompt_text ← effective_prompt(serve_config)
+    const list<int> prompt_ids ← live_tokenize(tok, prompt_text)
     stdout_write("prompt.ids=" + live_ids_text(prompt_ids) + "\n")
-    stdout_write("prompt.golden=" + live_ids_text(frozen_prompt_ids()) + "\n")
-    if live_first_divergence(prompt_ids, frozen_prompt_ids()) ≠ "none" {
-        panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
+    if prompt_text ≡ frozen_prompt_text() {
+        stdout_write("prompt.golden=" + live_ids_text(frozen_prompt_ids()) + "\n")
+        if live_first_divergence(prompt_ids, frozen_prompt_ids()) ≠ "none" {
+            panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
+        }
     }
 
     const ResidentModel model ← load_resident_weights(serve_config.model, admitted)
@@ -1562,39 +1618,63 @@ fn live_run(ServeConfig serve_config) → void {
 
     var config.GenerationConfig gen ← config.default()
     do {
-        gen ← config.construct_generation(8192, effective_max_prompt(serve_config), 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, model.eog_ids)
+        gen ← config.construct_generation(8192, effective_max_prompt(serve_config), serve_config.max_tokens, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, model.eog_ids)
     }
     catch err {
         panic "generation config failed: " + err.message
     }
 
+    # Stop policy: default eog_stop; --ignore-eos keeps generating to the
+    # --max-tokens ceiling. Selected outside the cape below (BD-3).
+    const decoder.StopPolicy stop ← live_stop_policy(serve_config.ignore_eos)
+
     var list<int> generated ← []
     do {
-        generated ← dense_gen.generate_dense(
+        generated ← dense_gen.generate_dense_with_stop(
             gen,
             prompt_ids,
             model.engine,
             (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
             layers,
-            decode.fresh_cancellation()
+            decode.fresh_cancellation(),
+            stop
         )
     }
     catch err {
         panic "generate_dense failed: " + err.message
     }
 
-    const list<int> golden ← golden_tokens_16()
-    const string divergence ← live_first_divergence(generated, golden)
-    const int matches ← live_token_match_count(generated, golden)
-    stdout_write("observed=" + live_ids_text(generated) + "\n")
-    stdout_write("golden=" + live_ids_text(golden) + "\n")
-    stdout_write("observed.n=" + (generated.length() ↦ string) + "\n")
-    stdout_write("token_match_count=" + (matches ↦ string) + "\n")
-    stdout_write("first_divergence=" + divergence + "\n")
-    if divergence ≡ "none" {
-        stdout_write("LIVE: PASS\n")
-    } else {
-        stdout_write("LIVE: FAIL\n")
+    # The one-shot result surface: space-joined generated ids and the decoded
+    # text (decode fails closed via live_decode).
+    stdout_write("ids=" + live_ids_flat(generated) + "\n")
+    const string text ← live_decode(tok, generated)
+    stdout_write("text=" + text + "\n")
+
+    # Oracle: only the frozen fixture has a golden. eog_stop compares the
+    # [30, 2] continuation; --ignore-eos compares the 16-token U5 golden.
+    var list<int> golden ← []
+    var bool oracle ← false
+    if prompt_text ≡ frozen_prompt_text() {
+        oracle ← true
+        if serve_config.ignore_eos {
+            golden ← golden_tokens_16()
+        } else {
+            golden ← frozen_eog_continuation()
+        }
+    }
+    if oracle {
+        const string divergence ← live_first_divergence(generated, golden)
+        const int matches ← live_token_match_count(generated, golden)
+        stdout_write("observed=" + live_ids_text(generated) + "\n")
+        stdout_write("golden=" + live_ids_text(golden) + "\n")
+        stdout_write("observed.n=" + (generated.length() ↦ string) + "\n")
+        stdout_write("token_match_count=" + (matches ↦ string) + "\n")
+        stdout_write("first_divergence=" + divergence + "\n")
+        if divergence ≡ "none" {
+            stdout_write("LIVE: PASS\n")
+        } else {
+            stdout_write("LIVE: FAIL\n")
+        }
     }
 }
 
@@ -1624,10 +1704,12 @@ fn print_help() → void {
     stdout_write("\n")
     stdout_write("Commands:\n")
     stdout_write("  serve                     Bind the HTTP server (U1–U4)\n")
-    stdout_write("  live                      One-shot G2 generate_dense vs the U5 golden\n")
+    stdout_write("  live                      One-shot prompt in, decoded ids + text out\n")
     stdout_write("\n")
     stdout_write("Options:\n")
     stdout_write("  -m, --model <PATH>        Path to the GGUF model file (required)\n")
+    stdout_write("      --prompt <TEXT>       Live one-shot prompt text (default: frozen fixture)\n")
+    stdout_write("      --ignore-eos          Live: generate past EOG until --max-tokens\n")
     stdout_write("      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)\n")
     stdout_write("      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)\n")
     stdout_write("      --max-tokens <N>      Default output token ceiling (default: 32)\n")
@@ -1642,7 +1724,7 @@ fn print_help() → void {
 # Parse argv (program name included at index 0) into a ServeConfig.
 # Every usage error exits before returning.
 fn parse_cli(list<string> argv) → ServeConfig {
-    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info" }
+    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", ignore_eos = false }
     var string subcommand ← ""
     var int i ← 1
 
@@ -1715,6 +1797,16 @@ fn parse_cli(list<string> argv) → ServeConfig {
             } else {
                 usage_error("invalid log-level '" + raw + "' (expected info|warn|error)")
             }
+        }
+        elif arg ≡ "--prompt" {
+            i ← i + 1
+            if i ≥ argv.length() then usage_error("missing value for --prompt")
+            const string raw ← argv.get(i) coalesce ""
+            if raw ≡ "" then usage_error("invalid prompt '' (expected non-empty text)")
+            config.prompt ← raw
+        }
+        elif arg ≡ "--ignore-eos" {
+            config.ignore_eos ← true
         }
         elif arg.starts_with("-") and arg.length() > 1 {
             usage_error("unknown option '" + arg + "'")
@@ -2077,6 +2169,23 @@ describe "serve cli parse" tag "inferentia" {
         const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--max-prompt", "2048"])
         assert cfg2.max_prompt ≡ 2048
     }
+    test "live prompt flag binds text; ignore-eos defaults off" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--prompt", "hello world"])
+        assert cfg.prompt ≡ "hello world"
+        assert not cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ "hello world"
+    }
+    test "live defaults select the frozen fixture prompt" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf"])
+        assert cfg.prompt ≡ ""
+        assert not cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ frozen_prompt_text()
+    }
+    test "ignore-eos flag parses on" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--ignore-eos"])
+        assert cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ frozen_prompt_text()
+    }
 }
 describe "health lifecycle" tag "inferentia" {
     test "state starts starting before admission" {
@@ -2227,7 +2336,7 @@ describe "generate request JSON parse" tag "inferentia" {
 }
 describe "generate config precedence" tag "inferentia" {
     test "body overrides server flag overrides default" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_tokens\":8,\"seed\":3}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 8192
@@ -2241,7 +2350,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "absent body fields inherit the server flags" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\"}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 4096
@@ -2253,7 +2362,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "body max_prompt overrides the server flag" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_prompt\":256}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.magna_promptus ≡ 256
