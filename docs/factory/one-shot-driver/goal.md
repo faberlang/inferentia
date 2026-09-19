@@ -1,6 +1,6 @@
 # GOAL: one-shot driver — Inferentia exercises the Gradus config/batch/encoding/KV surfaces
 
-**Status**: active — OSD-0 landed; emit-chain `faber-dev build inferentia` green (gate 3 `a4b70051`, 0 rustc); OSD-1 dispatching; OSD-2…OSD-5 gated on OSD-1; OSD-G1 blocked on gradus
+**Status**: active — OSD-0 and OSD-1 landed (`8f9bb2c`); serve done_when blocked on radix `do/catch` `Ok(ok) => unreachable!` (need `c53e0aee`, Hand `21ef0152`); OSD-2…OSD-5 gated on that; OSD-G1 blocked on gradus
 **Created**: 2026-09-18
 **Campaign:** `inferentia` (`docs/factory/inferentia/CAMPAIGN.md`)
 **Source:** operator scope directive 2026-09-18 (via mind task `3c851c35`): "an Inferentia that runs with a single prompt and returns the result … the parts that need work are the things around configuration flags, batch sizes, types of encoding that's used, and KV cache types … the best way to test it is by using one-shot prompts through Inferentia."
@@ -221,7 +221,7 @@ ledger below to remain accurate against the then-current gradus head.
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | OSD-0 compile repair | done | `a343b98a` | `63f9f26` | check-green only; the `build .` leg of the written done_when could not have passed (emit chain postdates this commit) |
-| OSD-1 unpin max_prompt + knob | in flight | — | — | emit-chain gate 3 green (`a4b70051`) |
+| OSD-1 unpin max_prompt + knob | done | `cb433109` | `8f9bb2c` | live no longer dies at max_prompt; serve rows wait on `c53e0aee` |
 | OSD-2 live one-shot entry | pending | — | — | resolves live golden/stop mismatch |
 | OSD-3 rope knobs | pending | — | — | |
 | OSD-4 kv-cache knob | pending | — | — | f32 oracle only |
