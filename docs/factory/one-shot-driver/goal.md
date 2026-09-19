@@ -1,13 +1,13 @@
 # GOAL: one-shot driver — Inferentia exercises the Gradus config/batch/encoding/KV surfaces
 
-**Status**: active — OSD-0 landed (`inferentia` `63f9f26`); OSD-1 (unpin `max_prompt`) is next and is gated on the first emitted-Rust repair unit (inventory `eb0fc48c`: 14 causes, U1 handled-block error slot first); OSD-2…OSD-5 gated on OSD-1; OSD-G1 blocked on gradus
+**Status**: active — OSD-0 check-green landed (`63f9f26`); OSD-1…OSD-5 gated on the emitted-Rust chain reaching `faber-dev build inferentia` green (inventory `eb0fc48c`: 14 causes / 13 units; U1 in flight as `118a2787`), not on U1 alone; OSD-G1 blocked on gradus
 **Created**: 2026-09-18
 **Campaign:** `inferentia` (`docs/factory/inferentia/CAMPAIGN.md`)
 **Source:** operator scope directive 2026-09-18 (via mind task `3c851c35`): "an Inferentia that runs with a single prompt and returns the result … the parts that need work are the things around configuration flags, batch sizes, types of encoding that's used, and KV cache types … the best way to test it is by using one-shot prompts through Inferentia."
 **Repos:** `inferentia` (all writes); `gradus` (read/cited; one blocked row)
-**Related:** tokenizer serve landed (`3c2aa4b`); OSD-0 name migration landed (`63f9f26`); inventory `eb0fc48c` returned (14 causes / 13 units, all radix-emitter; first repair is U1)
+**Related:** tokenizer serve landed (`3c2aa4b`, discharges `fd205b79`); OSD-0 check-green (`63f9f26`); inventory `eb0fc48c`; pair-synthesis `e7291912` verdict `record_risk` (`59903fc2` × `026d7b78`)
 
-Evidence revisions: inferentia `83693e0`, gradus `89919e7`, resolved by path (`faber.lock` → `../gradus`). Toolchain: radix-built `faber` 1.10.0 (`radix/target/debug/faber`) is the working authority — gradus checks green under it; the PATH `faber` is a stale 1.8.0 (`~/.cargo/bin/faber`) that fails every checkout (PKG001/PARSE001) and must not be used for proofs.
+Evidence revisions: inferentia `9ef4add`, gradus `823e37e`. Toolchain: `faber-dev` (install script `radix/scripta/install-faber-dev`). Rebuild it after every radix emitter landing. The PATH `faber` is a stale product binary and must not be used for proofs. `eb0fc48c` is a Vivi handle, not a git SHA.
 
 ## Invariant
 
@@ -189,7 +189,7 @@ blocked and named, not shouldered.
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
 | OSD-0 | compile repair — repoint the 42 dangling gradus-qualified names | — | none |
-| OSD-1 | unpin `max_prompt` + `--max-prompt`/body field | OSD-0; `fd205b79` (landing; same file) | none |
+| OSD-1 | unpin `max_prompt` + `--max-prompt`/body field | OSD-0; tokenizer serve `3c2aa4b` (landed); emit-chain build-green | none |
 | OSD-2 | `live --prompt` one-shot entry (arbitrary prompt, decoded text, stop-policy/golden fix) | OSD-1 | none |
 | OSD-3 | rope knobs (`--rope-policy/--rope-theta/--rope-scale`) | OSD-2 | none |
 | OSD-4 | KV cache type knob (`--kv-cache`) | OSD-2 | none |
@@ -220,8 +220,8 @@ ledger below to remain accurate against the then-current gradus head.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| OSD-0 compile repair | done | `a343b98a` | `63f9f26` | check 42→0 (later 91→0); rustc emit errors are a separate inventory, not this row |
-| OSD-1 unpin max_prompt + knob | pending | — | — | critical path; unblocks fd205b79 acceptance |
+| OSD-0 compile repair | done | `a343b98a` | `63f9f26` | check-green only; the `build .` leg of the written done_when could not have passed (emit chain postdates this commit) |
+| OSD-1 unpin max_prompt + knob | pending | — | — | do not dispatch until `faber-dev build inferentia` is green |
 | OSD-2 live one-shot entry | pending | — | — | resolves live golden/stop mismatch |
 | OSD-3 rope knobs | pending | — | — | |
 | OSD-4 kv-cache knob | pending | — | — | f32 oracle only |

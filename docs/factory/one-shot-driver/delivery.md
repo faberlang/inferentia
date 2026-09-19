@@ -1,15 +1,13 @@
 # DELIVERY: one-shot driver — unit graph
 
-**Goal:** `docs/factory/one-shot-driver/goal.md` (planned; this lowering)
-**Evidence revisions:** inferentia `83693e0`, gradus `89919e7`
+**Goal:** `docs/factory/one-shot-driver/goal.md` (active; this lowering)
+**Evidence revisions:** inferentia `9ef4add`, gradus `823e37e`
 **Model row (absolute, packet-independent):**
 `MODEL=/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf`
-**Toolchain (verified this session):** the PATH `faber` is a stale 1.8.0 that
-fails every checkout (PKG001/PARSE001); the working authority is the
-radix-built binary. Every command below sets
-`FABER=/Users/ianzepp/work/faberlang/radix/target/debug/faber` (1.10.0;
-gradus checks green under it). If Mind deploys 1.10.0 to PATH, bare `faber`
-supersedes — until then proofs must use the absolute path.
+**Toolchain:** `FABER=faber-dev` with `FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang`.
+Rebuild `faber-dev` after every radix emitter landing (`radix/scripta/install-faber-dev`).
+The PATH `faber` is a stale product binary and must not be used for proofs.
+OSD rows stay behind `faber-dev build inferentia` green, not behind U1 alone.
 **Command convention:** every `done_when` below is ONE `bash -ec` command,
 run from the inferentia repo root of whatever checkout you are in (main or
 packet). It builds, runs, and decides pass/fail by its own exit code.
