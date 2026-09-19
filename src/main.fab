@@ -701,35 +701,22 @@ class EncodeResult {
     list<int> ids
 }
 
-# Text → token ids (the "encode" phase). G3 `tokenizator.tokenize` is the
-# encoder; it needs vocab/merge tables from the admitted row. Those tables
-# are not loaded here yet, so tokenize fails closed and the pinned fallback
-# serves the frozen fixture. One verified prompt row, never silent
-# generalization.
+# Text → token ids (the "encode" phase) through the admitted model's real
+# G3 tokenizer (carried on ResidentModel). `tokenizator.tokenize` is the
+# provider encode route — SMOLLM scanner + parse-special on. A typed
+# TokenizerError fails closed with its message; the request path maps that
+# to 400.
 #
-# The fallback conditional lives in a separate function: the MIR stepper
-# (`faber test`) cannot lower a conditional inside a `cape` block that wraps a
-# library-provider call (recorded toolchain limitation, cf. BD-3).
-fn encode_fallback(string prompt, string bind_error) → EncodeResult {
-    if prompt ≡ frozen_prompt_text() {
-        return EncodeResult { ok = true, error = "", ids = frozen_prompt_ids() }
-    }
-    return EncodeResult { ok = false, error = "prompt encode unavailable: " + bind_error, ids = [] }
-}
-
-# G3 tokenize needs a Tokenizer. Empty tables fail closed (G3 contract).
-fn encode_tokenizer() → tokenizator.Tokenizer ⇥ tokenizator.TokenizerError {
-    return tokenizator.build_tables([], [], [], [])
-}
-
-fn encode_prompt(string prompt) → EncodeResult {
+# The catch arm stays straight-line: the MIR stepper (`faber test`) cannot
+# lower a conditional inside a `cape` block that wraps a library-provider
+# call (recorded toolchain limitation, cf. BD-3).
+fn encode_prompt(tokenizator.Tokenizer tok, string prompt) → EncodeResult {
     do {
-        const tokenizator.Tokenizer t ← encode_tokenizer()
-        const list<int> ids ← tokenizator.tokenize(t, prompt)
+        const list<int> ids ← tokenizator.tokenize(tok, prompt)
         return EncodeResult { ok = true, error = "", ids = ids }
     }
     catch err {
-        return encode_fallback(prompt, tokenizator.message(err))
+        return EncodeResult { ok = false, error = "prompt encode failed: " + tokenizator.message(err), ids = [] }
     }
 }
 
@@ -737,19 +724,27 @@ fn encode_prompt(string prompt) → EncodeResult {
 # Response assembly (D3) + error classification
 # ---------------------------------------------------------------------------
 
-# The generated ids joined with spaces — a documented placeholder: no
-# detokenizer exists yet (BD-1), so `text` cannot be the decoded surface; the
-# ids in `tokens` are authoritative.
-fn tokens_text(list<int> tokens) → string {
-    var string out ← ""
-    var int i ← 0
-    while i < tokens.length() {
-        if i > 0 { out ← out + " " }
-        const int t ← tokens.get(i) coalesce 0
-        out ← out + (t ↦ string)
-        i ← i + 1
+# Ids → detokenized text (G3 `tokenizator.decode` over the admitted
+# tokenizer). Decode happens before any response body is assembled or any
+# stream is opened: a typed TokenizerError fails closed with its message
+# instead of emitting a partial body. The id list in `tokens` stays the
+# machine surface.
+#
+# Straight-line catch arm for the same BD-3 stepper constraint as
+# encode_prompt.
+class DecodeResult {
+    bool ok
+    string error
+    string text
+}
+
+fn tokens_text(tokenizator.Tokenizer tok, list<int> tokens) → DecodeResult {
+    do {
+        return DecodeResult { ok = true, error = "", text = tokenizator.decode(tok, tokens) }
     }
-    return out
+    catch err {
+        return DecodeResult { ok = false, error = "token decode failed: " + tokenizator.message(err), text = "" }
+    }
 }
 
 fn tokens_json(list<int> tokens) → string {
@@ -774,13 +769,14 @@ fn finish_reason(int generated, int max_tokens) → string {
 
 # The /generate response body. `model` carries the minimal identity facts
 # held by this server (sha256 + path); the full /model identity surface is
-# U3 (not yet landed).
-fn generate_response_body(ServerState st, list<int> tokens, list<int> prompt_ids, int max_tokens) → string {
+# U3 (not yet landed). `text` is the pre-decoded detokenized string (the
+# caller fails closed before assembly); `tokens` keeps the machine surface.
+fn generate_response_body(ServerState st, string text, list<int> tokens, list<int> prompt_ids, int max_tokens) → string {
     const int pn ← prompt_ids.length()
     const int cn ← tokens.length()
     const int total ← pn + cn
     const string reason ← finish_reason(cn, max_tokens)
-    return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + tokens_text(tokens) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
+    return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + json_escape(text) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
 }
 
 # JSON-string escape for health/error bodies (typed causes carry quotes,
@@ -865,8 +861,10 @@ fn wants_sse(server.Incoming incoming) → bool {
 }
 
 # One SSE `token` event per generated id, then a `done` event with the JSON
-# body. Generation is still a batch call; this is the I1 wire stream.
-fn send_generate_stream(server.Incoming incoming, ServerState st, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
+# body. Generation is still a batch call; this is the I1 wire stream. The
+# detokenized `text` arrives pre-decoded — decode fails closed before the
+# stream opens, so no partial body is emitted.
+fn send_generate_stream(server.Incoming incoming, ServerState st, string text, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
     const server.Stream stream ← server.open_sse(incoming)
     var int i ← 0
     while i < tokens.length() {
@@ -875,7 +873,7 @@ fn send_generate_stream(server.Incoming incoming, ServerState st, list<int> toke
         server.send_event(stream, ev)
         i ← i + 1
     }
-    const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, tokens, prompt_ids, max_tokens), id = "", retry = "" }
+    const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, text, tokens, prompt_ids, max_tokens), id = "", retry = "" }
     server.send_event(stream, done)
     server.finish_stream(stream, server.keep_alive(incoming.req.headers))
 }
@@ -955,7 +953,9 @@ fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.Genera
     return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32, eog_ids)
 }
 
-# Resident dense weights for /generate (loaded once after admit).
+# Resident dense weights + the admitted G3 tokenizer for /generate (loaded
+# once after admit). The tokenizer carried here is the one built from the
+# admitted manifest — the same tables the EOG stop set came from.
 class ResidentModel {
     bool ready
     dense_gen.DenseEngine engine
@@ -964,6 +964,7 @@ class ResidentModel {
     list<list<tensor.Tensor>> strata
     structure.KVStructure structure
     gguf_manifest.GgufManifest manifest
+    tokenizator.Tokenizer tokenizer
     list<int> eog_ids
 }
 
@@ -979,6 +980,26 @@ fn empty_manifest() → gguf_manifest.GgufManifest {
     }
 }
 
+# The unready placeholder tokenizer: empty tables. `build_tables` rejects
+# an empty vocabulary, so the placeholder is the class literal; any encode
+# against it fails closed with a typed UnknownTrace cause (never read on
+# the serve path — /generate is 503-gated before ready).
+fn empty_tokenizer() → tokenizator.Tokenizer {
+    var map<string, int> no_vocab ← empty
+    var map<string, int> no_merges ← empty
+    return tokenizator.Tokenizer {
+        words = [],
+        vocab = no_vocab,
+        concursus = no_merges,
+        special_texts = [],
+        specialia_ids = [],
+        eog = [],
+        add_bos = false,
+        chat_template = "",
+        multitudo = 0
+    }
+}
+
 fn empty_resident() → ResidentModel {
     return ResidentModel {
         ready = false,
@@ -988,6 +1009,7 @@ fn empty_resident() → ResidentModel {
         strata = [],
         structure = structure.default_kv_structure(),
         manifest = empty_manifest(),
+        tokenizer = empty_tokenizer(),
         eog_ids = []
     }
 }
@@ -1354,8 +1376,8 @@ fn inspect_model(string path, string sha) → gguf_manifest.GgufManifest {
 
 fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → ResidentModel {
     const int total ← live_file_size(path)
-    const tokenizator.Tokenizer tokenizer ← live_build_tokenizer(admitted)
-    const list<int> eog_ids ← tokenizator.artifact_eog(tokenizer)
+    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
+    const list<int> eog_ids ← tokenizator.artifact_eog(tok)
     var tensor.Tensor embed ← tensor.default()
     var tensor.Tensor norm_s ← tensor.default()
     embed ← live_load_one(path, total, admitted, "model.embed_tokens", 0)
@@ -1434,6 +1456,7 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
         strata = strata,
         structure = kv_structure,
         manifest = admitted,
+        tokenizer = tok,
         eog_ids = eog_ids
     }
 }
@@ -1792,8 +1815,9 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
         reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
         return
     }
-    # Encode: text → token ids (BD-1 absent → pinned frozen-fixture row).
-    const EncodeResult enc ← encode_prompt(parsed.prompt)
+    # Encode: text → token ids through the admitted model's real G3
+    # tokenizer (the tables loaded with the resident weights).
+    const EncodeResult enc ← encode_prompt(model.tokenizer, parsed.prompt)
     if not enc.ok {
         reply_json(incoming, 400, error_body(enc.error))
         return
@@ -1804,10 +1828,17 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
-        } elif wants_sse(incoming) {
-            send_generate_stream(incoming, st, tokens, enc.ids, cfg.maxima_verborum)
         } else {
-            reply_json(incoming, 200, generate_response_body(st, tokens, enc.ids, cfg.maxima_verborum))
+            # Detokenize before any body assembly or stream open: a typed
+            # decode failure fails closed instead of emitting a partial body.
+            const DecodeResult dec ← tokens_text(model.tokenizer, tokens)
+            if not dec.ok {
+                reply_json(incoming, classify_generate_error(dec.error), error_body(dec.error))
+            } elif wants_sse(incoming) {
+                send_generate_stream(incoming, st, dec.text, tokens, enc.ids, cfg.maxima_verborum)
+            } else {
+                reply_json(incoming, 200, generate_response_body(st, dec.text, tokens, enc.ids, cfg.maxima_verborum))
+            }
         }
     }
     catch err {
@@ -2154,23 +2185,31 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
 }
+# Test fixture tokenizer: a minimal byte-level BPE table (ids 0..2, one
+# merge "a b" → "ab") built through the same public table constructor the
+# artifact path uses.
+fn table_tokenizer() → tokenizator.Tokenizer {
+    do {
+        return tokenizator.build_tables([0, 1, 2], ["a", "b", "ab"], ["a b"], [])
+    }
+    catch err {
+        panic "test tokenizer tables failed: " + tokenizator.message(err)
+    }
+}
+
 describe "prompt encode" tag "inferentia" {
-    test "frozen fixture text maps to the pinned prompt ids (BD-1 absent placeholder)" {
-        # Tests the pure fallback directly: the wrapper (encode_prompt) calls
-        # G3 tokenizator.tokenize, which the MIR stepper (`faber test`)
-        # cannot execute (recorded toolchain limitation, cf. BD-3).
-        const EncodeResult enc ← encode_fallback(frozen_prompt_text(), "gradus:tokenizer tables not loaded from the admitted row")
+    test "table-built tokenizer encodes through G3 tokenize" {
+        const EncodeResult enc ← encode_prompt(table_tokenizer(), "ab")
         assert enc.ok
         const int n ← enc.ids.length()
-        assert n ≡ 9
+        assert n ≡ 1
         const int first ← enc.ids.get(0) coalesce 0
-        assert first ≡ 504
+        assert first ≡ 2
     }
-    test "any other prompt rejects with the typed cause" {
-        const EncodeResult enc ← encode_fallback("some other text", "gradus:tokenizer tables not loaded from the admitted row (G3 tokenize needs vocab/merge tables)")
+    test "empty-table tokenizer fails closed with the typed cause" {
+        const EncodeResult enc ← encode_prompt(empty_tokenizer(), "some other text")
         assert not enc.ok
-        assert enc.error.contains("prompt encode unavailable")
-        assert enc.error.contains("gradus:tokenizer")
+        assert enc.error.contains("prompt encode failed")
     }
 }
 describe "generate error classification" tag "inferentia" {
@@ -2196,24 +2235,40 @@ describe "generate response" tag "inferentia" {
         assert finish_reason(5, 16) ≡ "eos"
         assert finish_reason(0, 1) ≡ "eos"
     }
-    test "tokens text and json formats" {
+    test "tokens text decodes through the tokenizer" {
+        const DecodeResult joined ← tokens_text(table_tokenizer(), [0, 1])
+        assert joined.ok
+        assert joined.text ≡ "ab"
+        const DecodeResult empty ← tokens_text(table_tokenizer(), [])
+        assert empty.ok
+        assert empty.text ≡ ""
+    }
+    test "out-of-range token id fails closed with the typed cause" {
+        const DecodeResult dec ← tokens_text(table_tokenizer(), [7])
+        assert not dec.ok
+        assert dec.error.contains("token id outside the vocabulary range")
+    }
+    test "tokens json machine surface" {
         const list<int> tokens ← [30, 198, 198]
-        assert tokens_text(tokens) ≡ "30 198 198"
         assert tokens_json(tokens) ≡ "[30,198,198]"
         const list<int> empty ← []
-        assert tokens_text(empty) ≡ ""
         assert tokens_json(empty) ≡ "[]"
     }
     test "generate response body shape" {
         const ServerState st ← admitted(new_state("/models/x.gguf"), "2fa3f013")
-        const list<int> tokens ← [30, 198, 198]
+        const list<int> tokens ← [2, 0, 1]
         const list<int> prompt_ids ← [504, 2365]
-        const string body ← generate_response_body(st, tokens, prompt_ids, 16)
+        const string body ← generate_response_body(st, "abab", tokens, prompt_ids, 16)
         assert body.contains("\"model\"")
-        assert body.contains("\"text\":\"30 198 198\"")
-        assert body.contains("\"tokens\":[30,198,198]")
+        assert body.contains("\"text\":\"abab\"")
+        assert body.contains("\"tokens\":[2,0,1]")
         assert body.contains("\"finish_reason\":\"eos\"")
         assert body.contains("\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}")
+    }
+    test "generate response body escapes decoded text" {
+        const ServerState st ← admitted(new_state("/models/x.gguf"), "2fa3f013")
+        const string body ← generate_response_body(st, "a\"b", [0], [1], 1)
+        assert body.contains("\"text\":\"a\\\"b\"")
     }
     test "error body escapes embedded quotes" {
         const string body ← error_body("malformed generation config wire")
