@@ -716,7 +716,7 @@ fn encode_prompt(tokenizator.Tokenizer tok, string prompt) → EncodeResult {
         return EncodeResult { ok = true, error = "", ids = ids }
     }
     catch err {
-        return EncodeResult { ok = false, error = "prompt encode failed: " + tokenizator.message(err), ids = [] }
+        return EncodeResult { ok = false, error = "prompt encode failed: " + err.message, ids = [] }
     }
 }
 
@@ -743,7 +743,7 @@ fn tokens_text(tokenizator.Tokenizer tok, list<int> tokens) → DecodeResult {
         return DecodeResult { ok = true, error = "", text = tokenizator.decode(tok, tokens) }
     }
     catch err {
-        return DecodeResult { ok = false, error = "token decode failed: " + tokenizator.message(err), text = "" }
+        return DecodeResult { ok = false, error = "token decode failed: " + err.message, text = "" }
     }
 }
 
@@ -942,7 +942,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
         raw ← host_hauri(path)
     }
     catch err {
-        throw variant CapsulaMala { message = err }
+        throw variant BadCapsule { message = err }
     }
     const list<int<u8>> data ← bytes_as_u8(raw)
     const capsule.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
@@ -959,9 +959,9 @@ fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.Genera
 class ResidentModel {
     bool ready
     dense_gen.DenseEngine engine
-    tensor.Tensor embed
-    tensor.Tensor norm_s
-    list<list<tensor.Tensor>> strata
+    tensor.NumericBlock embed
+    tensor.NumericBlock norm_s
+    list<list<tensor.NumericBlock>> strata
     structure.KVStructure structure
     gguf_manifest.GgufManifest manifest
     tokenizator.Tokenizer tokenizer
@@ -970,10 +970,10 @@ class ResidentModel {
 
 fn empty_manifest() → gguf_manifest.GgufManifest {
     return gguf_manifest.GgufManifest {
-        identitas = artifact.ContentIdentity { algorithm = "sha-256", digest = "", length = 0 },
+        identity = artifact.ContentIdentity { algorithm = "sha-256", digest = "", length = 0 },
         version = 0,
-        concordatio = 0,
-        data_inceptum = 0,
+        alignment = 0,
+        data_start = 0,
         artifact_length = 0,
         metadata = [],
         tensors = []
@@ -1019,7 +1019,7 @@ fn fresh_resident_caches(ResidentModel model) → list<kv.KVCache> {
         return dense.empty_caches(model.structure, "smollm2", "360m", "f32-staged", "smollm")
     }
     catch err {
-        panic "empty caches failed: " + dense.message(err)
+        panic "empty caches failed: " + err.message
     }
 }
 
@@ -1058,24 +1058,24 @@ fn live_read_range(string path, int start, int length) → bytes {
     return call 'solum:partem' (args) ↦ bytes
 }
 
-fn live_range(string path, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
+fn live_range(string path, int total, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
     if initium < 0 or longitudo < 0 or initium > total - longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
+        throw variant BadSource { message = "range request exceeds the artifact" }
     }
     const bytes raw ← live_read_range(path, initium, longitudo)
     if raw.length() ≠ longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "short range read" }
+        throw variant BadSource { message = "short range read" }
     }
-    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
+    return raw
 }
 
-fn live_prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
+fn live_prefix_range(list<int> prefix, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
     if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
+        throw variant BadSource { message = "inspection attempted to read the tensor data region" }
     }
     const list<int> segment ← prefix.slice(initium, initium + longitudo)
     const bytes raw ← segment ↦ bytes
-    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
+    return raw
 }
 
 fn live_ends(string s, string tail) → bool {
@@ -1109,10 +1109,10 @@ fn live_ids_text(list<int> ids) → string {
 
 fn live_block_elements(tensor_view.TensorView v) → int {
     match v.layout {
-        case gguf_manifest.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+        case gguf_manifest.Known const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
             return elementa_per_blockum
         }
-        case gguf_manifest.Ignota const typo {
+        case gguf_manifest.Unknown const typo {
             return 0
         }
     }
@@ -1127,10 +1127,10 @@ fn live_window(int remaining, int block) → int {
 
 fn live_limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> {
     do {
-        return gguf_manifest.limes_payloadis(m, gguf_name)
+        return gguf_manifest.payload_limit(m, gguf_name)
     }
     catch err {
-        panic "payload range failed for " + gguf_name + ": " + gguf_manifest.message(err)
+        panic "payload range failed for " + gguf_name + ": " + err.message
     }
 }
 
@@ -1139,29 +1139,29 @@ fn live_bind(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → t
         return tensor_view.links(m, p)
     }
     catch err {
-        panic "view bind failed for " + p.name + ": " + tensor_view.message(err)
+        panic "view bind failed for " + p.name + ": " + err.message
     }
 }
 
-fn live_slice(tensor_view.TensorView v, int off, int n, (int, int) → gguf_manifest.SourceRead fons) → list<f32> {
+fn live_slice(tensor_view.TensorView v, int off, int n, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError fons) → list<f32> {
     do {
         return tensor_view.materialize_slice(v, off, n, fons)
     }
     catch err {
-        panic "window materialize failed for " + v.name + ": " + tensor_view.message(err)
+        panic "window materialize failed for " + v.name + ": " + err.message
     }
 }
 
-fn live_tensor(list<f32> datos, list<int> forma) → tensor.Tensor {
+fn live_tensor(list<f32> datos, list<int> forma) → tensor.NumericBlock {
     do {
         return tensor.construct(datos, forma)
     }
     catch err {
-        panic "tensor construct failed: " + tensor.message(err)
+        panic "tensor construct failed: " + err.message
     }
 }
 
-fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.Tensor {
+fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.NumericBlock {
     const tuple<int, int> limes ← live_limits(m, gguf_name)
     const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
         name = gguf_name,
@@ -1182,7 +1182,7 @@ fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string 
             v,
             off,
             n,
-            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ live_range(via, total, initium, longitudo)
+            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(via, total, initium, longitudo)
         )
         var int pi ← 0
         while pi < part.length() {
@@ -1213,8 +1213,8 @@ fn live_gguf_name(string family, int stratum) → string {
     panic "unknown canonical tensor name: " + family
 }
 
-fn live_kmajor_to_linear(tensor.Tensor t) → tensor.Tensor {
-    const list<int> f ← t.shape()
+fn live_kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock {
+    const list<int> f ← t.shape
     if f.length() ≠ 2 {
         panic "linear weight must be rank 2"
     }
@@ -1245,32 +1245,32 @@ fn live_linear_family(string family) → bool {
     return false
 }
 
-fn live_load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.Tensor {
+fn live_load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.NumericBlock {
     const string gguf_name ← live_gguf_name(family, stratum)
-    const tensor.Tensor stored ← live_materialize(via, total, m, gguf_name)
+    const tensor.NumericBlock stored ← live_materialize(via, total, m, gguf_name)
     if live_linear_family(family) {
         return live_kmajor_to_linear(stored)
     }
     return stored
 }
 
-fn live_lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, list<list<tensor.Tensor>> strata) → dense.Lookup {
-    if nomen ≡ "model.embed_tokens" { return dense.Lookup { successus = true, tensorem = embed, message = "" } }
-    if nomen ≡ "model.norm" { return dense.Lookup { successus = true, tensorem = norm_s, message = "" } }
+fn live_lookup(string nomen, int stratum, tensor.NumericBlock embed, tensor.NumericBlock norm_s, list<list<tensor.NumericBlock>> strata) → tensor.NumericBlock ⇥ dense.DenseError {
+    if nomen ≡ "model.embed_tokens" { return embed }
+    if nomen ≡ "model.norm" { return norm_s }
     if stratum < 0 or stratum ≥ strata.length() {
-        return dense.Lookup { successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string) }
+        throw variant MissingTensor { message = "layer out of range: " + (stratum ↦ string) }
     }
     const int slot ← live_slot(nomen)
     if slot < 0 {
-        return dense.Lookup { successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen }
+        throw variant MissingTensor { message = "unknown canonical tensor: " + nomen }
     }
-    var list<tensor.Tensor> missing ← []
-    const list<tensor.Tensor> row ← strata.get(stratum) coalesce missing
+    var list<tensor.NumericBlock> missing ← []
+    const list<tensor.NumericBlock> row ← strata.get(stratum) coalesce missing
     if slot ≥ row.length() {
-        return dense.Lookup { successus = false, tensorem = embed, message = "layer slot missing: " + nomen }
+        throw variant MissingTensor { message = "layer slot missing: " + nomen }
     }
-    const tensor.Tensor t ← row.get(slot) coalesce embed
-    return dense.Lookup { successus = true, tensorem = t, message = "" }
+    const tensor.NumericBlock t ← row.get(slot) coalesce embed
+    return t
 }
 
 fn live_indices(int n) → list<int> {
@@ -1330,7 +1330,7 @@ fn live_build_tokenizer(gguf_manifest.GgufManifest m) → tokenizator.Tokenizer 
         return tokenizator.build(m)
     }
     catch err {
-        panic "G3 tokenizer tables failed: " + tokenizator.message(err)
+        panic "G3 tokenizer tables failed: " + err.message
     }
 }
 
@@ -1339,7 +1339,7 @@ fn live_tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
         return tokenizator.tokenize(tok, prompt)
     }
     catch err {
-        panic "G3 tokenize failed: " + tokenizator.message(err)
+        panic "G3 tokenize failed: " + err.message
     }
 }
 
@@ -1363,13 +1363,13 @@ fn inspect_model(string path, string sha) → gguf_manifest.GgufManifest {
     var gguf_manifest.GgufManifest admitted ← empty_manifest()
     do {
         admitted ← gguf_manifest.inspect(
-            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ live_prefix_range(prefix, initium, longitudo),
+            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_prefix_range(prefix, initium, longitudo),
             total,
             identitas
         )
     }
     catch err {
-        panic "manifest admission failed: " + gguf_manifest.message(err)
+        panic "manifest admission failed: " + err.message
     }
     return admitted
 }
@@ -1378,8 +1378,8 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
     const int total ← live_file_size(path)
     const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
     const list<int> eog_ids ← tokenizator.artifact_eog(tok)
-    var tensor.Tensor embed ← tensor.default()
-    var tensor.Tensor norm_s ← tensor.default()
+    var tensor.NumericBlock embed ← tensor.default()
+    var tensor.NumericBlock norm_s ← tensor.default()
     embed ← live_load_one(path, total, admitted, "model.embed_tokens", 0)
     norm_s ← live_load_one(path, total, admitted, "model.norm", 0)
 
@@ -1394,10 +1394,10 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
         "model.layers.mlp.up_proj",
         "model.layers.mlp.down_proj"
     ]
-    var list<list<tensor.Tensor>> strata ← []
+    var list<list<tensor.NumericBlock>> strata ← []
     var int stratum ← 0
     while stratum < 32 {
-        var list<tensor.Tensor> row ← []
+        var list<tensor.NumericBlock> row ← []
         var int f ← 0
         while f < families.length() {
             row.append(live_load_one(path, total, admitted, families.get(f) coalesce "", stratum))
@@ -1476,34 +1476,34 @@ fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.
         g,
         ids,
         model.engine,
-        (string n, int s) → dense.Lookup ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
+        (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
         layers,
         decode.fresh_cancellation(),
         stop
     )
 }
 
-fn live_run(ServeConfig config) → void {
+fn live_run(ServeConfig serve_config) → void {
     stdout_write("inferentia live: admit + G3 tokenizer + generate_dense\n")
-    stdout_write("model.path=" + config.model + "\n")
+    stdout_write("model.path=" + serve_config.model + "\n")
 
     var string sha ← ""
     do {
-        sha ← admit_model(config.model)
+        sha ← admit_model(serve_config.model)
     }
     catch err {
-        panic "admit failed: " + gguf.message(err)
+        panic "admit failed: " + err.message
     }
     stdout_write("admit.sha256=" + sha + "\n")
     if sha ≠ pinned_digest() {
         panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
     }
 
-    const int total ← live_file_size(config.model)
+    const int total ← live_file_size(serve_config.model)
     stdout_write("model.bytes=" + (total ↦ string) + "\n")
 
-    const gguf_manifest.GgufManifest admitted ← inspect_model(config.model, sha)
-    stdout_write("manifest.data_offset=" + (admitted.data_inceptum ↦ string) + "\n")
+    const gguf_manifest.GgufManifest admitted ← inspect_model(serve_config.model, sha)
+    stdout_write("manifest.data_offset=" + (admitted.data_start ↦ string) + "\n")
 
     const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
     stdout_write("tokenizer.vocab=" + (tok.multitudo ↦ string) + "\n")
@@ -1515,7 +1515,7 @@ fn live_run(ServeConfig config) → void {
         panic "G3 tokenize diverged from pinned P10: " + live_first_divergence(prompt_ids, frozen_prompt_ids())
     }
 
-    const ResidentModel model ← load_resident_weights(config.model, admitted)
+    const ResidentModel model ← load_resident_weights(serve_config.model, admitted)
     const list<kv.KVCache> layers ← fresh_resident_caches(model)
     stdout_write("cache.layers=" + (layers.length() ↦ string) + "\n")
 
@@ -1533,7 +1533,7 @@ fn live_run(ServeConfig config) → void {
             gen,
             prompt_ids,
             model.engine,
-            (string n, int s) → dense.Lookup ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
+            (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
             layers,
             decode.fresh_cancellation()
         )
@@ -1893,7 +1893,7 @@ fn serve(ServeConfig config) → void {
         stderr_write("inferentia: model admitted (sha256 " + sha + ")\n")
     }
     catch err {
-        const string cause ← gguf.message(err)
+        const string cause ← err.message
         state ← failed(state, cause)
         stderr_write("inferentia: admission failed: " + cause + "\n")
     }
@@ -2193,7 +2193,7 @@ fn table_tokenizer() → tokenizator.Tokenizer {
         return tokenizator.build_tables([0, 1, 2], ["a", "b", "ab"], ["a b"], [])
     }
     catch err {
-        panic "test tokenizer tables failed: " + tokenizator.message(err)
+        panic "test tokenizer tables failed: " + err.message
     }
 }
 
