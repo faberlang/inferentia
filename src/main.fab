@@ -71,12 +71,14 @@ import from "gradus:tokenizer/bpe" tokenizator
 # Documented constants are the defaults; server flags override them. `context`
 # uses 0 as the "derive from the model's context_length" sentinel (the model is
 # admitted at startup); an explicit `--context 0` is rejected as a config error.
+# `max_prompt` uses the same 0 sentinel (default: the model context limit).
 # ---------------------------------------------------------------------------
 class ServeConfig {
     string model
     string host
     int port
     int max_tokens
+    int max_prompt
     int context
     int seed
     string log_level
@@ -159,6 +161,8 @@ class GenerateRequest {
     bool has_prompt
     bool has_max_tokens
     int max_tokens
+    bool has_max_prompt
+    int max_prompt
     bool has_temperature
     float temperature
     bool has_top_k
@@ -179,6 +183,7 @@ fn fresh_generate_request() → GenerateRequest {
     return GenerateRequest {
         ok = true, error = "", prompt = "", has_prompt = false,
         has_max_tokens = false, max_tokens = 0,
+        has_max_prompt = false, max_prompt = 0,
         has_temperature = false, temperature = 0.0,
         has_top_k = false, top_k = 0,
         has_top_p = false, top_p = 0.0,
@@ -192,6 +197,7 @@ fn rejected_generate_request(string error) → GenerateRequest {
     return GenerateRequest {
         ok = false, error = error, prompt = "", has_prompt = false,
         has_max_tokens = false, max_tokens = 0,
+        has_max_prompt = false, max_prompt = 0,
         has_temperature = false, temperature = 0.0,
         has_top_k = false, top_k = 0,
         has_top_p = false, top_p = 0.0,
@@ -204,6 +210,7 @@ fn rejected_generate_request(string error) → GenerateRequest {
 fn generate_request_with_prompt(GenerateRequest r, string v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = v, has_prompt = true,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -215,6 +222,19 @@ fn generate_request_with_prompt(GenerateRequest r, string v) → GenerateRequest
 fn generate_request_with_max_tokens(GenerateRequest r, int v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = true, max_tokens = v,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
+        has_temperature = r.has_temperature, temperature = r.temperature,
+        has_top_k = r.has_top_k, top_k = r.top_k,
+        has_top_p = r.has_top_p, top_p = r.top_p,
+        has_min_p = r.has_min_p, min_p = r.min_p,
+        has_repeat_penalty = r.has_repeat_penalty, repeat_penalty = r.repeat_penalty,
+        has_seed = r.has_seed, seed = r.seed }
+}
+
+fn generate_request_with_max_prompt(GenerateRequest r, int v) → GenerateRequest {
+    return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
+        has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = true, max_prompt = v,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -226,6 +246,7 @@ fn generate_request_with_max_tokens(GenerateRequest r, int v) → GenerateReques
 fn generate_request_with_temperature(GenerateRequest r, float v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = true, temperature = v,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -237,6 +258,7 @@ fn generate_request_with_temperature(GenerateRequest r, float v) → GenerateReq
 fn generate_request_with_top_k(GenerateRequest r, int v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = true, top_k = v,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -248,6 +270,7 @@ fn generate_request_with_top_k(GenerateRequest r, int v) → GenerateRequest {
 fn generate_request_with_top_p(GenerateRequest r, float v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = true, top_p = v,
@@ -259,6 +282,7 @@ fn generate_request_with_top_p(GenerateRequest r, float v) → GenerateRequest {
 fn generate_request_with_min_p(GenerateRequest r, float v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -270,6 +294,7 @@ fn generate_request_with_min_p(GenerateRequest r, float v) → GenerateRequest {
 fn generate_request_with_repeat_penalty(GenerateRequest r, float v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -281,6 +306,7 @@ fn generate_request_with_repeat_penalty(GenerateRequest r, float v) → Generate
 fn generate_request_with_seed(GenerateRequest r, int v) → GenerateRequest {
     return GenerateRequest { ok = r.ok, error = r.error, prompt = r.prompt, has_prompt = r.has_prompt,
         has_max_tokens = r.has_max_tokens, max_tokens = r.max_tokens,
+        has_max_prompt = r.has_max_prompt, max_prompt = r.max_prompt,
         has_temperature = r.has_temperature, temperature = r.temperature,
         has_top_k = r.has_top_k, top_k = r.top_k,
         has_top_p = r.has_top_p, top_p = r.top_p,
@@ -557,6 +583,14 @@ fn json_parse_generate_body(string body) → GenerateRequest {
                 return rejected_generate_request("field 'max_tokens' must be an integer")
             }
             out ← generate_request_with_max_tokens(out, val.int_value)
+        } elif fname ≡ "max_prompt" {
+            if out.has_max_prompt {
+                return rejected_generate_request("duplicate field 'max_prompt'")
+            }
+            if val.kind ≠ 2 {
+                return rejected_generate_request("field 'max_prompt' must be an integer")
+            }
+            out ← generate_request_with_max_prompt(out, val.int_value)
         } elif fname ≡ "temperature" {
             if out.has_temperature {
                 return rejected_generate_request("duplicate field 'temperature'")
@@ -665,12 +699,19 @@ class GenerateConfig {
     float poena_repetitionis
 }
 
+# The effective prompt-token admission bound: the configured --max-prompt, or
+# the model context limit when unset (0 sentinel, same convention as context).
+fn effective_max_prompt(ServeConfig server) → int {
+    return if_int(server.max_prompt ≡ 0, model_context_limit(), server.max_prompt)
+}
+
 # D2 precedence: body fields override server flags, flags override defaults.
-# `magna_promptus` is the prefill batch — pinned to 1 (one request at a time
-# in I1); the delivery doc's prose maps it to the prompt text, but the gradus
-# contract and the engine treat it as the batch size (observed behavior wins).
+# `magna_promptus` is the prompt-token admission bound, not a request batch:
+# the engine rejects any prompt longer than it with "prompt length exceeds
+# max_prompt" (gradus generation/dense.fab:237).
 fn build_generate_config(GenerateRequest req, ServeConfig server) → GenerateConfig {
     const int contextus ← if_int(server.context ≡ 0, model_context_limit(), server.context)
+    const int magna_promptus ← if_int(req.has_max_prompt, req.max_prompt, effective_max_prompt(server))
     const int maxima ← if_int(req.has_max_tokens, req.max_tokens, server.max_tokens)
     const int seed ← if_int(req.has_seed, req.seed, server.seed)
     const float temperatura ← if_float(req.has_temperature, req.temperature, 0.0)
@@ -680,7 +721,7 @@ fn build_generate_config(GenerateRequest req, ServeConfig server) → GenerateCo
     const float poena ← if_float(req.has_repeat_penalty, req.repeat_penalty, 1.0)
     return GenerateConfig {
         contextus = contextus,
-        magna_promptus = 1,
+        magna_promptus = magna_promptus,
         maxima_verborum = maxima,
         semen = seed,
         temperatura = temperatura,
@@ -1521,7 +1562,7 @@ fn live_run(ServeConfig serve_config) → void {
 
     var config.GenerationConfig gen ← config.default()
     do {
-        gen ← config.construct_generation(8192, 1, 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, model.eog_ids)
+        gen ← config.construct_generation(8192, effective_max_prompt(serve_config), 16, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, model.eog_ids)
     }
     catch err {
         panic "generation config failed: " + err.message
@@ -1590,6 +1631,7 @@ fn print_help() → void {
     stdout_write("      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)\n")
     stdout_write("      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)\n")
     stdout_write("      --max-tokens <N>      Default output token ceiling (default: 32)\n")
+    stdout_write("      --max-prompt <N>      Prompt-token admission bound (default: model limit)\n")
     stdout_write("      --context <N>         Session context ceiling (default: model limit)\n")
     stdout_write("      --seed <N>            Deterministic seed (default: 1)\n")
     stdout_write("      --log-level <LEVEL>   stderr verbosity: info|warn|error (default: info)\n")
@@ -1600,7 +1642,7 @@ fn print_help() → void {
 # Parse argv (program name included at index 0) into a ServeConfig.
 # Every usage error exits before returning.
 fn parse_cli(list<string> argv) → ServeConfig {
-    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, context = 0, seed = 1, log_level = "info" }
+    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info" }
     var string subcommand ← ""
     var int i ← 1
 
@@ -1639,6 +1681,14 @@ fn parse_cli(list<string> argv) → ServeConfig {
             const int value ← parse_int(raw)
             if value < 1 then usage_error("invalid max-tokens '" + raw + "' (expected >= 1)")
             config.max_tokens ← value
+        }
+        elif arg ≡ "--max-prompt" {
+            i ← i + 1
+            if i ≥ argv.length() then usage_error("missing value for --max-prompt")
+            const string raw ← argv.get(i) coalesce ""
+            const int value ← parse_int(raw)
+            if value < 1 then usage_error("invalid max-prompt '" + raw + "' (expected >= 1)")
+            config.max_prompt ← value
         }
         elif arg ≡ "--context" {
             i ← i + 1
@@ -1908,7 +1958,7 @@ fn serve(ServeConfig config) → void {
         do {
             const GenerateConfig warmup_cfg ← GenerateConfig {
                 contextus = model_context_limit(),
-                magna_promptus = 1,
+                magna_promptus = effective_max_prompt(config),
                 maxima_verborum = 1,
                 semen = config.seed,
                 temperatura = 0.0,
@@ -1987,14 +2037,16 @@ describe "serve cli parse" tag "inferentia" {
         assert cfg.host ≡ "127.0.0.1"
         assert cfg.port ≡ 8080
         assert cfg.max_tokens ≡ 32
+        assert cfg.max_prompt ≡ 0
         assert cfg.seed ≡ 1
         assert cfg.log_level ≡ "info"
         assert cfg.model ≡ "/tmp/model.gguf"
     }
     test "server flags override documented constants" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--max-prompt", "2048", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
         assert cfg.port ≡ 9090
         assert cfg.max_tokens ≡ 16
+        assert cfg.max_prompt ≡ 2048
         assert cfg.seed ≡ 7
         assert cfg.host ≡ "127.0.0.1"
         assert cfg.log_level ≡ "warn"
@@ -2018,6 +2070,12 @@ describe "serve cli parse" tag "inferentia" {
         assert cfg.context ≡ 0
         const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--context", "4096"])
         assert cfg2.context ≡ 4096
+    }
+    test "max prompt is unset until a flag provides it" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        assert cfg.max_prompt ≡ 0
+        const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--max-prompt", "2048"])
+        assert cfg2.max_prompt ≡ 2048
     }
 }
 describe "health lifecycle" tag "inferentia" {
@@ -2102,6 +2160,7 @@ describe "generate request JSON parse" tag "inferentia" {
         assert req.ok
         assert req.prompt ≡ "The quick brown fox jumps over the lazy dog"
         assert not req.has_max_tokens
+        assert not req.has_max_prompt
         assert not req.has_temperature
         assert not req.has_seed
     }
@@ -2133,12 +2192,20 @@ describe "generate request JSON parse" tag "inferentia" {
         assert not (json_parse_generate_body("{\"prompt\":42}")).ok
         assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_tokens\":16.5}")).ok
         assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_tokens\":\"x\"}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_prompt\":\"x\"}")).ok
         assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"seed\":true}")).ok
     }
     test "duplicate fields are rejected" {
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"a\",\"prompt\":\"b\"}")
         assert not req.ok
         assert req.error.contains("duplicate field")
+    }
+    test "max_prompt body field parses and rejects bad shapes" {
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"hi\",\"max_prompt\":128}")
+        assert req.ok
+        assert (req.has_max_prompt) and (req.max_prompt ≡ 128)
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_prompt\":1.5}")).ok
+        assert not (json_parse_generate_body("{\"prompt\":\"hi\",\"max_prompt\":4,\"max_prompt\":8}")).ok
     }
     test "whitespace and integer-form floats are tolerated" {
         const GenerateRequest req ← json_parse_generate_body("  { \"prompt\" : \"hi\" , \"max_tokens\" : 4 , \"temperature\" : 1 }  ")
@@ -2160,13 +2227,13 @@ describe "generate request JSON parse" tag "inferentia" {
 }
 describe "generate config precedence" tag "inferentia" {
     test "body overrides server flag overrides default" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, context = 0, seed = 1, log_level = "info" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info" }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_tokens\":8,\"seed\":3}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 8192
         assert cfg.maxima_verborum ≡ 8
         assert cfg.semen ≡ 3
-        assert cfg.magna_promptus ≡ 1
+        assert cfg.magna_promptus ≡ 8192
         assert cfg.temperatura ≡ 0.0
         assert cfg.top_k ≡ 0
         assert cfg.top_p ≡ 1.0
@@ -2174,15 +2241,22 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "absent body fields inherit the server flags" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, context = 4096, seed = 7, log_level = "info" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info" }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\"}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 4096
         assert cfg.maxima_verborum ≡ 16
+        assert cfg.magna_promptus ≡ 1024
         assert cfg.semen ≡ 7
         assert cfg.temperatura ≡ 0.0
         assert cfg.top_p ≡ 1.0
         assert cfg.poena_repetitionis ≡ 1.0
+    }
+    test "body max_prompt overrides the server flag" {
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info" }
+        const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_prompt\":256}")
+        const GenerateConfig cfg ← build_generate_config(req, server)
+        assert cfg.magna_promptus ≡ 256
     }
 }
 # Test fixture tokenizer: a minimal byte-level BPE table (ids 0..2, one
