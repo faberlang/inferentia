@@ -1,11 +1,11 @@
 # GOAL: one-shot driver — Inferentia exercises the Gradus config/batch/encoding/KV surfaces
 
-**Status**: planned — registered `gol_2dbd9ee15e6ab237`; delivery rows OSD-0…OSD-5 lowered and READY, OSD-G1 (non-F32 KV cache execution) blocked on gradus; OSD-0 (compile repair) dispatching first, OSD-1 and the rest gated behind it
+**Status**: active — OSD-0 landed (`inferentia` `63f9f26`); OSD-1 (unpin `max_prompt`) is next and is gated on the first emitted-Rust repair unit (inventory `eb0fc48c`: 14 causes, U1 handled-block error slot first); OSD-2…OSD-5 gated on OSD-1; OSD-G1 blocked on gradus
 **Created**: 2026-09-18
 **Campaign:** `inferentia` (`docs/factory/inferentia/CAMPAIGN.md`)
 **Source:** operator scope directive 2026-09-18 (via mind task `3c851c35`): "an Inferentia that runs with a single prompt and returns the result … the parts that need work are the things around configuration flags, batch sizes, types of encoding that's used, and KV cache types … the best way to test it is by using one-shot prompts through Inferentia."
 **Repos:** `inferentia` (all writes); `gradus` (read/cited; one blocked row)
-**Related:** Hand `fd205b79` (in flight — serve-path tokenizer encode/decode), verification `55bfe796` (in flight — current-head runtime receipt)
+**Related:** tokenizer serve landed (`3c2aa4b`); OSD-0 name migration landed (`63f9f26`); inventory `eb0fc48c` returned (14 causes / 13 units, all radix-emitter; first repair is U1)
 
 Evidence revisions: inferentia `83693e0`, gradus `89919e7`, resolved by path (`faber.lock` → `../gradus`). Toolchain: radix-built `faber` 1.10.0 (`radix/target/debug/faber`) is the working authority — gradus checks green under it; the PATH `faber` is a stale 1.8.0 (`~/.cargo/bin/faber`) that fails every checkout (PKG001/PARSE001) and must not be used for proofs.
 
@@ -220,7 +220,7 @@ ledger below to remain accurate against the then-current gradus head.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| OSD-0 compile repair | pending | — | — | gates every other row and the in-flight Hand's acceptance |
+| OSD-0 compile repair | done | `a343b98a` | `63f9f26` | check 42→0 (later 91→0); rustc emit errors are a separate inventory, not this row |
 | OSD-1 unpin max_prompt + knob | pending | — | — | critical path; unblocks fd205b79 acceptance |
 | OSD-2 live one-shot entry | pending | — | — | resolves live golden/stop mismatch |
 | OSD-3 rope knobs | pending | — | — | |
