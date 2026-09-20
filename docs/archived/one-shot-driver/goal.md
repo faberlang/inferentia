@@ -1,6 +1,6 @@
 # GOAL: one-shot driver — Inferentia exercises the Gradus config/batch/encoding/KV surfaces
 
-**Status**: active — OSD-0…OSD-2 landed (`0a187fe`); OSD-3 dispatching; OSD-4…OSD-5 gated on OSD-3; OSD-G1 blocked on gradus
+**Status**: deferred — directionally wrong per operator 2026-09-20 registry reboot: the goal defaulted to CPU inference where GPU (Metal/Gradus) was the intent; salvageable parts recorded in vivi wants; recoverable
 **Created**: 2026-09-18
 **Campaign:** `inferentia` (`docs/factory/inferentia/CAMPAIGN.md`)
 **Source:** operator scope directive 2026-09-18 (via mind task `3c851c35`): "an Inferentia that runs with a single prompt and returns the result … the parts that need work are the things around configuration flags, batch sizes, types of encoding that's used, and KV cache types … the best way to test it is by using one-shot prompts through Inferentia."

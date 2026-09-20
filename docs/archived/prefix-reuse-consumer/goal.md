@@ -1,6 +1,6 @@
 # GOAL: prefix-reuse-consumer — tenant-scoped prepared-state retention and warm request evidence
 
-**Status**: planned — pre-implementation; consumer boundary drafted; true TTFT unit waits on Inferentia I2's streaming host-effect prerequisite
+**Status**: deferred — shelved at the 2026-09-20 registry reboot; pre-implementation; recoverable
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** operator expansion of the SD5 consumer/evidence boundary, grounded in the live Inferentia server, generate gate, and Gradus prepared-state contract
