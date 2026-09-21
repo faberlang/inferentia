@@ -86,6 +86,7 @@ class ServeConfig {
     int seed
     string log_level
     string prompt
+    string expected_digest
     bool ignore_eos
 }
 
@@ -1555,8 +1556,55 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
     }
 }
 
-fn load_resident_model(string path, string sha) → ResidentModel {
+# Digest gate for serve admission (G1-U9): the refusal diagnostic when the
+# admitted digest does not match the operator-supplied --expected-digest,
+# null when admission proceeds. An empty expected means unset — serve exists
+# to load arbitrary models, so an unset flag keeps today's behavior. Pure so
+# the serve rows can feed digests as inputs.
+fn check_expected_digest(string admitted, string expected) → string ∪ null {
+    if expected ≡ "" {
+        return null
+    }
+    if admitted ≡ expected {
+        return null
+    }
+    return "model digest " + admitted + " does not match --expected-digest " + expected
+}
+
+# Materialization re-verify (G1-U9): the file is re-digested at load time,
+# after admission, so a swap between admit and load cannot serve swapped
+# weights. The refusal covers the admit → load TOCTOU (materialized ≠
+# admitted) and the --expected-digest pin carried from serve; null lets
+# load_resident_weights read. Pure so the rows feed digests as inputs.
+fn check_materialized_digest(string admitted, string materialized, string expected) → string ∪ null {
+    if materialized ≠ admitted {
+        return "model changed between admission and materialization: admitted=" + admitted + " materialized=" + materialized
+    }
+    if expected ≠ "" and materialized ≠ expected {
+        return "materialized digest " + materialized + " does not match --expected-digest " + expected
+    }
+    return null
+}
+
+# Admit → load TOCTOU closure (G1-U9): the admitted manifest was inspected
+# from the bytes read at admission time, so before load_resident_weights
+# reads the file again, re-digest it and require equality with the admitted
+# sha (and with --expected-digest when set). A swapped or unreadable file
+# throws BadCapsule, which serve routes into the failed state — the load
+# never proceeds and swapped weights are never served.
+fn load_resident_model(string path, string sha, string expected_digest) → ResidentModel ⇥ gguf.GgufError {
     const gguf_manifest.GgufManifest admitted ← inspect_model(path, sha)
+    var string materialized ← ""
+    do {
+        materialized ← host_digestio(path)
+    }
+    catch err {
+        throw variant BadCapsule { message = err }
+    }
+    const string ∪ null refusal ← check_materialized_digest(sha, materialized, expected_digest)
+    if refusal not is null {
+        throw variant BadCapsule { message = refusal coalesce "" }
+    }
     return load_resident_weights(path, admitted)
 }
 
@@ -1709,6 +1757,7 @@ fn print_help() → void {
     stdout_write("Options:\n")
     stdout_write("  -m, --model <PATH>        Path to the GGUF model file (required)\n")
     stdout_write("      --prompt <TEXT>       Live one-shot prompt text (default: frozen fixture)\n")
+    stdout_write("      --expected-digest <SHA256>  Serve: require the admitted sha256 to match (default: unset)\n")
     stdout_write("      --ignore-eos          Live: generate past EOG until --max-tokens\n")
     stdout_write("      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)\n")
     stdout_write("      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)\n")
@@ -1724,7 +1773,7 @@ fn print_help() → void {
 # Parse argv (program name included at index 0) into a ServeConfig.
 # Every usage error exits before returning.
 fn parse_cli(list<string> argv) → ServeConfig {
-    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", ignore_eos = false }
+    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false }
     var string subcommand ← ""
     var int i ← 1
 
@@ -1797,6 +1846,11 @@ fn parse_cli(list<string> argv) → ServeConfig {
             } else {
                 usage_error("invalid log-level '" + raw + "' (expected info|warn|error)")
             }
+        }
+        elif arg ≡ "--expected-digest" {
+            i ← i + 1
+            if i ≥ argv.length() then usage_error("missing value for --expected-digest")
+            config.expected_digest ← argv.get(i) coalesce ""
         }
         elif arg ≡ "--prompt" {
             i ← i + 1
@@ -2023,14 +2077,22 @@ fn accept_loop_step(bool serving, string err) → bool {
 
 fn serve(ServeConfig config) → void {
     # U2 admission ordering: bind first, then admit BEFORE any allocation.
-    # Weight materialization is out of this path: admit only verifies the
-    # digest and the pinned-row structure (BD-2 gate), never forward/generate.
+    # admit computes the whole-file digest and pins the pinned-row structure
+    # (BD-2 gate) — gguf.admit receives the digest but never compares it
+    # against a pin. Digest verification lives in the live pin (live_run),
+    # the optional --expected-digest flag checked here at admission, and the
+    # materialization re-verify in load_resident_model (admit → load TOCTOU).
+    # Weight materialization is out of this path: never forward/generate.
     const server.Listener listener ← server.bind(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
     do {
         const string sha ← admit_model(state.model_path)
+        const string ∪ null digest_refusal ← check_expected_digest(sha, config.expected_digest)
+        if digest_refusal not is null {
+            throw variant BadCapsule { message = digest_refusal coalesce "" }
+        }
         state ← admitted(state, sha)
         stderr_write("inferentia: model admitted (sha256 " + sha + ")\n")
     }
@@ -2043,10 +2105,20 @@ fn serve(ServeConfig config) → void {
     # U4 generation readiness: load the dense weights exactly once and prove
     # generate_dense_with_stop (eog_stop) can decode before serving. Every
     # /generate reuses the resident model (fresh KV caches per request). A
-    # failed load or warm-up is an admission/load failure (D5 → exit 2).
+    # failed load or warm-up is an admission/load failure (D5 → exit 2):
+    # load_resident_model re-verifies the digest at materialization, so a
+    # file swapped between admit and load throws into the failed state here.
     var ResidentModel resident ← empty_resident()
     if state.state ≡ "ready" {
-        resident ← load_resident_model(state.model_path, state.sha256)
+        do {
+            resident ← load_resident_model(state.model_path, state.sha256, config.expected_digest)
+        }
+        catch err {
+            state ← failed(state, err.message)
+            stderr_write("inferentia: model load failed: " + err.message + "\n")
+        }
+    }
+    if state.state ≡ "ready" {
         do {
             const GenerateConfig warmup_cfg ← GenerateConfig {
                 contextus = model_context_limit(),
@@ -2336,7 +2408,7 @@ describe "generate request JSON parse" tag "inferentia" {
 }
 describe "generate config precedence" tag "inferentia" {
     test "body overrides server flag overrides default" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", ignore_eos = false }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_tokens\":8,\"seed\":3}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 8192
@@ -2350,7 +2422,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "absent body fields inherit the server flags" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", ignore_eos = false }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\"}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 4096
@@ -2362,7 +2434,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "body max_prompt overrides the server flag" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", ignore_eos = false }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_prompt\":256}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.magna_promptus ≡ 256
@@ -2556,5 +2628,48 @@ describe "http module" tag "inferentia" {
         raw.put("body", "" ↦ value)
         const server.Incoming incoming ← server.incoming_of(raw ↦ value)
         assert wants_sse(incoming)
+    }
+}
+describe "serve expected digest" tag "inferentia" {
+    test "unset flag keeps today's behavior: any admitted digest passes" {
+        # Default unset (G1-U9 clause 1): serve exists to load arbitrary
+        # models, so the admission gate returns null for every digest.
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        assert cfg.expected_digest ≡ ""
+        assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
+        assert check_expected_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
+    }
+    test "set flag binds from the cli" {
+        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
+        assert cfg.expected_digest ≡ "2fa3f013"
+    }
+    test "matching digest passes the admission gate" {
+        assert check_expected_digest("2fa3f013", "2fa3f013") is null
+    }
+    test "mismatching digest is refused with the pin diagnostic" {
+        # Clause 2: the refusal is the thrown cause, which serve's catch maps
+        # into the failed state — admission never reaches `ready`, so the
+        # model is never served and there is no panic path.
+        const string ∪ null refusal ← check_expected_digest("aaaa", "bbbb")
+        assert refusal not is null
+        assert (refusal coalesce "").contains("aaaa")
+        assert (refusal coalesce "").contains("bbbb")
+    }
+    test "file swapped between admit and materialization is caught" {
+        # Clause 3: the re-verify at load time compares against the admitted
+        # sha, so swapped bytes throw before load_resident_weights reads.
+        const string ∪ null refusal ← check_materialized_digest("admitted-sha", "swapped-sha", "")
+        assert refusal not is null
+        assert (refusal coalesce "").contains("admitted-sha")
+        assert (refusal coalesce "").contains("swapped-sha")
+    }
+    test "materialized digest equal to admitted passes, with or without the flag" {
+        assert check_materialized_digest("same-sha", "same-sha", "") is null
+        assert check_materialized_digest("same-sha", "same-sha", "same-sha") is null
+    }
+    test "materialized digest mismatching the flag is caught" {
+        const string ∪ null refusal ← check_materialized_digest("same-sha", "same-sha", "flag-sha")
+        assert refusal not is null
+        assert (refusal coalesce "").contains("flag-sha")
     }
 }
