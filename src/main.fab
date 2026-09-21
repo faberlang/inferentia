@@ -2005,12 +2005,39 @@ fn handle_model(server.Incoming incoming, ServerState st, ServeConfig config) �
     reply_json(incoming, 200, model_body(st, config.max_tokens))
 }
 
+# Pre-encode prompt-length gate (S-F4 / B5-U2): before this gate the only
+# prompt bound was the token-level max_prompt, enforced at generation — after
+# encode. The gate is a text-length bound in the runtime string-length unit;
+# the HTTP body cap stays the outer bound and max_prompt keeps its
+# post-encode generation meaning.
+const int MAX_PROMPT_LENGTH ← 65536
+
+# Size gate for the /generate prompt: the refusal diagnostic when the prompt
+# exceeds MAX_PROMPT_LENGTH, null when the prompt may flow to encode. Pure so
+# the gate rows can feed it prompts as inputs.
+fn check_prompt_length(string prompt) → string ∪ null {
+    if prompt.length() > MAX_PROMPT_LENGTH {
+        return "prompt length " + (prompt.length() ↦ string) + " exceeds the bound " + (MAX_PROMPT_LENGTH ↦ string)
+    }
+    return null
+}
+
+# Exact-length ASCII prompt for the gate rows; doubling keeps the build short
+# and slice trims to the requested length.
+fn prompt_of_length(int n) → string {
+    var string p ← "a"
+    while p.length() < n {
+        p ← p + p
+    }
+    return p.slice(0, n)
+}
+
 # Handle a /generate request (U4). The pipeline: method gate → state gate →
-# cancellation checkpoint → body read → minimal JSON parse → cancellation
-# checkpoint → encode → engine generate (prefill + greedy decode with the
-# admitted tokenizer EOG stop set and the max_tokens budget) → response assembly.
-# Domain validation (the gradus reject rows) is enforced by the engine with
-# typed causes; this unit maps them to 400/500.
+# cancellation checkpoint → body read → minimal JSON parse → prompt-length
+# gate → cancellation checkpoint → encode → engine generate (prefill + greedy
+# decode with the admitted tokenizer EOG stop set and the max_tokens budget)
+# → response assembly. Domain validation (the gradus reject rows) is enforced
+# by the engine with typed causes; this unit maps them to 400/500.
 fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeConfig config, ResidentModel model) → void {
     # Method gate: /generate is POST (D3).
     if incoming.req.method ≠ "POST" {
@@ -2039,6 +2066,13 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
     const GenerateRequest parsed ← json_parse_generate_body(body)
     if not parsed.ok {
         reply_json(incoming, 400, error_body(parsed.error))
+        return
+    }
+    # Pre-encode prompt-length gate (S-F4): reject over-bound prompts before
+    # the encode call; in-bound requests take the same path as before.
+    const string ∪ null too_long ← check_prompt_length(parsed.prompt)
+    if too_long not is null {
+        reply_json(incoming, 400, error_body(too_long coalesce ""))
         return
     }
     if st.cancelled {
@@ -2621,6 +2655,21 @@ describe "admission size ceiling" tag "inferentia" {
         assert refusal not is null
         assert (refusal coalesce "").contains((model_file_size_bytes() + 1) ↦ string)
         assert (refusal coalesce "").contains(model_file_size_bytes() ↦ string)
+    }
+}
+describe "generate prompt length gate" tag "inferentia" {
+    test "in-bound prompt passes the gate" {
+        assert check_prompt_length("hello") is null
+    }
+    test "prompt at the bound passes the gate" {
+        assert check_prompt_length(prompt_of_length(MAX_PROMPT_LENGTH)) is null
+    }
+    test "prompt one over the bound is refused with the size diagnostic" {
+        const int n ← MAX_PROMPT_LENGTH + 1
+        const string ∪ null refusal ← check_prompt_length(prompt_of_length(n))
+        assert refusal not is null
+        assert (refusal coalesce "").contains(n ↦ string)
+        assert (refusal coalesce "").contains(MAX_PROMPT_LENGTH ↦ string)
     }
 }
 describe "http module" tag "inferentia" {
