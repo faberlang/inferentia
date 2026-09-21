@@ -982,20 +982,54 @@ fn host_digestio(string path) → string ⇥ string {
     return call 'solum:digestio' (path) ↦ string
 }
 
-fn host_hauri(string path) → bytes ⇥ string {
-    return call 'solum:hauri' (path) ↦ bytes
+fn host_mensura(string path) → int ⇥ string {
+    return call 'solum:mensura' (path) ↦ int
 }
 
-# Path → host digest + bytes → gradus admit. Returns the carried digest.
+fn host_hauri(string path, int max) → bytes ⇥ string {
+    const list<value> args ← [path, max]
+    return call 'solum:hauri' (args) ↦ bytes
+}
+
+# Admission ceiling for the whole-file read: the pinned row's exact byte
+# length (S-F3 / G1-U8). Derived from the pinned size, never a new hardcoded
+# cap — the 64 MiB partem bound is a different route and stays untouched.
+fn model_size_ceiling() → int {
+    return model_file_size_bytes()
+}
+
+# Size gate for admit_model: the refusal diagnostic when `observed` exceeds
+# the ceiling, null when the path may be read whole. Pure so the admission
+# rows can feed it sizes as inputs.
+fn check_admission_size(int observed) → string ∪ null {
+    if observed > model_size_ceiling() {
+        return "model byte length " + (observed ↦ string) + " exceeds the admission ceiling " + (model_size_ceiling() ↦ string)
+    }
+    return null
+}
+
+# Path → host stat + digest + bytes → gradus admit. Returns the carried digest.
+# The stat runs first and the ceiling gate refuses an over-ceiling path before
+# host_hauri, so it is never read whole (G1-U8); the ceiling is passed through
+# to the route, and the stat precedes the read mirroring the radix pinned
+# admission oracle's stat-before-read order.
 fn admit_model(string path) → string ⇥ gguf.GgufError {
     var string digest ← ""
     var bytes raw ← ||
+    var string ∪ null size_refusal ← null
     do {
-        digest ← host_digestio(path)
-        raw ← host_hauri(path)
+        const int size ← host_mensura(path)
+        size_refusal ← check_admission_size(size)
+        if size_refusal is null {
+            digest ← host_digestio(path)
+            raw ← host_hauri(path, model_size_ceiling())
+        }
     }
     catch err {
         throw variant BadCapsule { message = err }
+    }
+    if size_refusal not is null {
+        throw variant BadCapsule { message = size_refusal coalesce "" }
     }
     const list<int<u8>> data ← bytes_as_u8(raw)
     const capsule.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
@@ -2500,6 +2534,21 @@ describe "model endpoint" tag "inferentia" {
         # stays valid JSON under any future identity source).
         const ServerState st ← admitted(new_state("/m.gguf"), "a\"b")
         assert model_body(st, 32).contains("\"sha256\":\"a\\\"b\"")
+    }
+}
+describe "admission size ceiling" tag "inferentia" {
+    test "pinned row size passes the ceiling gate" {
+        # The gate is pure so the rows feed sizes as inputs: admission refuses
+        # an over-ceiling path before host_hauri runs (admit_model only reaches
+        # the read when the gate returns null), and the pinned size passes.
+        assert check_admission_size(model_file_size_bytes()) is null
+        assert model_size_ceiling() ≡ model_file_size_bytes()
+    }
+    test "one byte over the pinned size is refused with the size diagnostic" {
+        const string ∪ null refusal ← check_admission_size(model_file_size_bytes() + 1)
+        assert refusal not is null
+        assert (refusal coalesce "").contains((model_file_size_bytes() + 1) ↦ string)
+        assert (refusal coalesce "").contains(model_file_size_bytes() ↦ string)
     }
 }
 describe "http module" tag "inferentia" {
