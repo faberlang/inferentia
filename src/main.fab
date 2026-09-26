@@ -504,10 +504,10 @@ fn json_parse_number(JsonCursor c) → JsonScalar {
     }
     const string token ← body_text.slice(start, cur.pos)
     if is_float {
-        const float fv ← token ↦ float ⇥ 0.0
+        const float fv ← token ↦ float ⊥ 0.0
         return JsonScalar { ok = true, error = "", kind = 3, text = token, int_value = 0, float_value = fv, pos = cur.pos }
     }
-    const int iv ← token ↦ int ⇥ 0
+    const int iv ← token ↦ int ⊥ 0
     return JsonScalar { ok = true, error = "", kind = 2, text = token, int_value = iv, float_value = 0.0, pos = cur.pos }
 }
 
@@ -869,8 +869,8 @@ fn request_body_text(value body_value) → string {
     if body_value is string {
         return body_value ↦ string
     }
-    const bytes raw ← body_value ↦ bytes ⇥ ||
-    return raw ↦ string ⇥ body_read_gap_marker()
+    const bytes raw ← body_value ↦ bytes ⊥ ||
+    return raw ↦ string ⊥ body_read_gap_marker()
 }
 
 fn request_body_from_raw(value request) → string {
@@ -1775,7 +1775,7 @@ fn usage_error(string message) → never {
 # Parse a base-10 integer; -1 when the text is not a valid integer.
 # (-1 is never a legal value for any D1 numeric option.)
 fn parse_int(string raw) → int {
-    return raw ↦ int ⇥ -1
+    return raw ↦ int ⊥ -1
 }
 
 # The D1 `serve` syntax, printed on `--help`.
@@ -2227,7 +2227,7 @@ fn serve(ServeConfig config) → void {
             # The decision lives in a helper: the MIR stepper (`faber test`)
             # cannot lower a conditional inside a `cape` block that wraps a
             # local call into a host route (recorded toolchain limitation).
-            serving ← accept_loop_step(serving, err ↦ string ⇥ "accept error")
+            serving ← accept_loop_step(serving, err ↦ string ⊥ "accept error")
         }
     }
 
