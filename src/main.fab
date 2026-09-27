@@ -833,13 +833,47 @@ fn generate_response_body(ServerState st, string text, list<int> tokens, list<in
     return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + json_escape(text) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
 }
 
-# JSON-string escape for health/error bodies (typed causes carry quotes,
-# e.g. unknown config field "bogus"; a configured model path may carry
-# backslashes; multi-line error text carries control characters). Escaping
-# order matters: backslashes first, then quotes, then control characters —
-# reversing the first two would double the inserted backslashes.
+# JSON-string escape for health/error/generate bodies (typed causes carry
+# quotes, e.g. unknown config field "bogus"; a configured model path may
+# carry backslashes; decoded model text carries arbitrary control bytes).
+# JSON requires every U+0000..U+001F code point escaped. A replace chain
+# cannot express that: it saw only the named controls, so \b, \f, \v and the
+# rest of the C0 range went out raw and a one-byte vocab token produced
+# invalid JSON (S-F5). The escape set and short forms mirror the canonical
+# serializer (`norma:json/lexer` escape_char/control_escape).
 fn json_escape(string s) → string {
-    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    var string out ← ""
+    var int i ← 0
+    while i < s.length() {
+        out ← out + json_escape_char(s.slice(i, i + 1))
+        i ← i + 1
+    }
+    return out
+}
+
+# One character as an escaped fragment. A character is a length-1 string, so
+# the C0 test reads its single UTF-8 byte; multi-byte characters pass
+# through unchanged.
+fn json_escape_char(string c) → string {
+    if c ≡ "\\" { return "\\\\" }
+    if c ≡ "\"" { return "\\\"" }
+    if c ≡ "\n" { return "\\n" }
+    if c ≡ "\r" { return "\\r" }
+    if c ≡ "\t" { return "\\t" }
+    const bytes encoded ← c ↦ bytes
+    if encoded.length() ≡ 1 {
+        const int code ← (encoded.get(0) coalesce (0 ∷ int<u8>)) ↦ int
+        if code ≡ 8 { return "\\b" }
+        if code ≡ 12 { return "\\f" }
+        if code < 32 {
+            return "\\u00" + json_hex_digit(code / 16) + json_hex_digit(code % 16)
+        }
+    }
+    return c
+}
+
+fn json_hex_digit(int digit) → string {
+    return "0123456789abcdef".slice(digit, digit + 1)
 }
 
 fn error_body(string error) → string {
@@ -1590,11 +1624,25 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
     }
 }
 
-# Digest gate for serve admission (G1-U9): the refusal diagnostic when the
-# admitted digest does not match the operator-supplied --expected-digest,
-# null when admission proceeds. An empty expected means unset — serve exists
-# to load arbitrary models, so an unset flag keeps today's behavior. Pure so
-# the serve rows can feed digests as inputs.
+# Pinned-row digest gate for serve admission (S-F1): the refusal diagnostic
+# when the admitted digest is not the pinned row's, null when it is. `serve`
+# runs this before the operator pin, so the structural admission contract
+# (`gguf.admit` is pinned to the SmolLM2 row) is always bound to one verified
+# file identity — the binding `live_run` has always applied. Pure so the
+# serve rows can feed digests as inputs.
+fn check_pinned_digest(string admitted) → string ∪ null {
+    if admitted ≠ pinned_digest() {
+        return "model digest " + admitted + " is not the pinned row digest " + pinned_digest()
+    }
+    return null
+}
+
+# Operator digest gate for serve admission (G1-U9): the refusal diagnostic
+# when the admitted digest does not match the operator-supplied
+# --expected-digest, null when admission proceeds. An empty expected means
+# unset — the flag adds no constraint of its own; the pinned-row binding is
+# `check_pinned_digest` above. Pure so the serve rows can feed digests as
+# inputs.
 fn check_expected_digest(string admitted, string expected) → string ∪ null {
     if expected ≡ "" {
         return null
@@ -2146,17 +2194,20 @@ fn accept_loop_step(bool serving, string err) → bool {
 fn serve(ServeConfig config) → void {
     # U2 admission ordering: bind first, then admit BEFORE any allocation.
     # admit computes the whole-file digest and pins the pinned-row structure
-    # (BD-2 gate) — gguf.admit receives the digest but never compares it
-    # against a pin. Digest verification lives in the live pin (live_run),
-    # the optional --expected-digest flag checked here at admission, and the
-    # materialization re-verify in load_resident_model (admit → load TOCTOU).
-    # Weight materialization is out of this path: never forward/generate.
+    # (BD-2 gate); serve then binds that digest to the pinned row (S-F1) and
+    # to any operator --expected-digest, and load_resident_model re-verifies
+    # at materialization (admit → load TOCTOU). Weight materialization is out
+    # of this path: never forward/generate.
     const server.Listener listener ← server.bind(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
     do {
         const string sha ← admit_model(state.model_path)
+        const string ∪ null pin_refusal ← check_pinned_digest(sha)
+        if pin_refusal not is null {
+            throw variant BadCapsule { message = pin_refusal coalesce "" }
+        }
         const string ∪ null digest_refusal ← check_expected_digest(sha, config.expected_digest)
         if digest_refusal not is null {
             throw variant BadCapsule { message = digest_refusal coalesce "" }
@@ -2369,6 +2420,16 @@ describe "health lifecycle" tag "inferentia" {
     }
     test "json escape escapes control characters" {
         assert json_escape("line1\nline2\tend") ≡ "line1\\nline2\\tend"
+    }
+    test "json escape maps the remaining C0 controls to escapes and \\u00XX" {
+        # S-F5: \b, \f, \v and the rest of U+0000..U+001F were emitted raw, so
+        # a one-byte vocab token produced invalid JSON. The fixtures are
+        # byte-built: a source `\b` / `\f` is not the C0 character.
+        assert json_escape(([8] ↦ bytes) ↦ string) ≡ "\\b"
+        assert json_escape(([12] ↦ bytes) ↦ string) ≡ "\\f"
+        assert json_escape(([1] ↦ bytes) ↦ string) ≡ "\\u0001"
+        assert json_escape(([31] ↦ bytes) ↦ string) ≡ "\\u001f"
+        assert json_escape("λ") ≡ "λ"
     }
     test "health body ready escapes quotes and backslashes in the path" {
         const ServerState st ← admitted(new_state("/models/a\"b\\c.gguf"), "2fa3f013")
@@ -2728,10 +2789,21 @@ describe "http module" tag "inferentia" {
         assert wants_sse(incoming)
     }
 }
-describe "serve expected digest" tag "inferentia" {
-    test "unset flag keeps today's behavior: any admitted digest passes" {
-        # Default unset (G1-U9 clause 1): serve exists to load arbitrary
-        # models, so the admission gate returns null for every digest.
+describe "serve admission digest" tag "inferentia" {
+    test "the pinned row digest passes the serve admission pin" {
+        assert check_pinned_digest(pinned_digest()) is null
+    }
+    test "a digest that is not the pinned row is refused on serve" {
+        # S-F1: serve binds admission to the pinned row like live_run, so a
+        # structure-valid file with other weights never reaches `ready`.
+        const string ∪ null refusal ← check_pinned_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert refusal not is null
+        assert (refusal coalesce "").contains("0000f013")
+        assert (refusal coalesce "").contains(pinned_digest())
+    }
+    test "unset flag adds no operator pin of its own" {
+        # Default unset (G1-U9 clause 1): the flag adds no constraint; the
+        # pinned-row binding is the separate check_pinned_digest gate above.
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
         assert cfg.expected_digest ≡ ""
         assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
