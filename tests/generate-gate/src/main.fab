@@ -80,15 +80,15 @@ fn record_prefix_16() → list<int> {
 
 # --- Config surface --------------------------------------------------------
 class GenerateConfig {
-    int contextus
-    int magna_promptus
-    int maxima_verborum
-    int semen
-    float temperatura
-    int top_k
-    float top_p
-    float min_p
-    float poena_repetitionis
+    var int contextus
+    var int magna_promptus
+    var int maxima_verborum
+    var int semen
+    var float temperatura
+    var int top_k
+    var float top_p
+    var float min_p
+    var float poena_repetitionis
 }
 
 fn frozen_config(int max_tokens) → GenerateConfig {
@@ -111,13 +111,13 @@ fn to_generation(GenerateConfig cfg, list<int> eog_ids) → config.GenerationCon
 
 # --- Resident dense model --------------------------------------------------
 class ResidentModel {
-    bool ready
-    dense_gen.DenseEngine engine
-    tensor.Tensor embed
-    tensor.Tensor norm_s
-    list<list<tensor.Tensor>> strata
-    structure.KVStructure structure
-    list<int> eog_ids
+    var bool ready
+    var dense_gen.DenseEngine engine
+    var tensor.Tensor embed
+    var tensor.Tensor norm_s
+    var list<list<tensor.Tensor>> strata
+    var structure.KVStructure structure
+    var list<int> eog_ids
 }
 
 fn empty_resident() → ResidentModel {

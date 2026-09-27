@@ -77,17 +77,17 @@ import from "gradus:tokenizer/bpe" tokenizator
 # `max_prompt` uses the same 0 sentinel (default: the model context limit).
 # ---------------------------------------------------------------------------
 class ServeConfig {
-    string model
-    string host
-    int port
-    int max_tokens
-    int max_prompt
-    int context
-    int seed
-    string log_level
-    string prompt
-    string expected_digest
-    bool ignore_eos
+    var string model
+    var string host
+    var int port
+    var int max_tokens
+    var int max_prompt
+    var int context
+    var int seed
+    var string log_level
+    var string prompt
+    var string expected_digest
+    var bool ignore_eos
 }
 
 # ---------------------------------------------------------------------------
@@ -95,11 +95,11 @@ class ServeConfig {
 # ---------------------------------------------------------------------------
 
 class ServerState {
-    string state
-    string sha256
-    string error_text
-    string model_path
-    bool cancelled
+    var string state
+    var string sha256
+    var string error_text
+    var string model_path
+    var bool cancelled
 }
 
 # A fresh state is `starting` until admission runs (bind → admit → allocate).
@@ -161,26 +161,26 @@ fn body_read_gap_marker() → string {
 # The parsed /generate request (D3). Presence flags implement D2 precedence:
 # an absent body field inherits the server flag, then the documented default.
 class GenerateRequest {
-    bool ok
-    string error
-    string prompt
-    bool has_prompt
-    bool has_max_tokens
-    int max_tokens
-    bool has_max_prompt
-    int max_prompt
-    bool has_temperature
-    float temperature
-    bool has_top_k
-    int top_k
-    bool has_top_p
-    float top_p
-    bool has_min_p
-    float min_p
-    bool has_repeat_penalty
-    float repeat_penalty
-    bool has_seed
-    int seed
+    var bool ok
+    var string error
+    var string prompt
+    var bool has_prompt
+    var bool has_max_tokens
+    var int max_tokens
+    var bool has_max_prompt
+    var int max_prompt
+    var bool has_temperature
+    var float temperature
+    var bool has_top_k
+    var int top_k
+    var bool has_top_p
+    var float top_p
+    var bool has_min_p
+    var float min_p
+    var bool has_repeat_penalty
+    var float repeat_penalty
+    var bool has_seed
+    var int seed
 }
 
 # A fresh empty request (all flags off; `ok` set true — the caller's error
@@ -331,19 +331,19 @@ fn generate_request_with_seed(GenerateRequest r, int v) → GenerateRequest {
 # ---------------------------------------------------------------------------
 
 class JsonCursor {
-    string text
-    int pos
+    var string text
+    var int pos
 }
 
 # kind: 1 = string, 2 = integer, 3 = float; 0 = error.
 class JsonScalar {
-    bool ok
-    string error
-    int kind
-    string text
-    int int_value
-    float float_value
-    int pos
+    var bool ok
+    var string error
+    var int kind
+    var string text
+    var int int_value
+    var float float_value
+    var int pos
 }
 
 fn json_fail(string error, int pos) → JsonScalar {
@@ -694,15 +694,15 @@ fn if_float(bool cond, float a, float b) → float {
 # ---------------------------------------------------------------------------
 
 class GenerateConfig {
-    int contextus
-    int magna_promptus
-    int maxima_verborum
-    int semen
-    float temperatura
-    int top_k
-    float top_p
-    float min_p
-    float poena_repetitionis
+    var int contextus
+    var int magna_promptus
+    var int maxima_verborum
+    var int semen
+    var float temperatura
+    var int top_k
+    var float top_p
+    var float min_p
+    var float poena_repetitionis
 }
 
 # The effective prompt-token admission bound: the configured --max-prompt, or
@@ -750,9 +750,9 @@ fn build_generate_config(GenerateRequest req, ServeConfig server) → GenerateCo
 # ---------------------------------------------------------------------------
 
 class EncodeResult {
-    bool ok
-    string error
-    list<int> ids
+    var bool ok
+    var string error
+    var list<int> ids
 }
 
 # Text → token ids (the "encode" phase) through the admitted model's real
@@ -787,9 +787,9 @@ fn encode_prompt(tokenizator.Tokenizer tok, string prompt) → EncodeResult {
 # Straight-line catch arm for the same BD-3 stepper constraint as
 # encode_prompt.
 class DecodeResult {
-    bool ok
-    string error
-    string text
+    var bool ok
+    var string error
+    var string text
 }
 
 fn tokens_text(tokenizator.Tokenizer tok, list<int> tokens) → DecodeResult {
@@ -1045,15 +1045,15 @@ fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.Genera
 # once after admit). The tokenizer carried here is the one built from the
 # admitted manifest — the same tables the EOG stop set came from.
 class ResidentModel {
-    bool ready
-    dense_gen.DenseEngine engine
-    tensor.NumericBlock embed
-    tensor.NumericBlock norm_s
-    list<list<tensor.NumericBlock>> strata
-    structure.KVStructure structure
-    gguf_manifest.GgufManifest manifest
-    tokenizator.Tokenizer tokenizer
-    list<int> eog_ids
+    var bool ready
+    var dense_gen.DenseEngine engine
+    var tensor.NumericBlock embed
+    var tensor.NumericBlock norm_s
+    var list<list<tensor.NumericBlock>> strata
+    var structure.KVStructure structure
+    var gguf_manifest.GgufManifest manifest
+    var tokenizator.Tokenizer tokenizer
+    var list<int> eog_ids
 }
 
 fn empty_manifest() → gguf_manifest.GgufManifest {
