@@ -106,7 +106,7 @@ fn frozen_config(int max_tokens) → GenerateConfig {
 }
 
 fn to_generation(GenerateConfig cfg, list<int> eog_ids) → config.GenerationConfig ⇥ config.GenerationError {
-    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ∷ f32, cfg.top_k, cfg.top_p ∷ f32, cfg.min_p ∷ f32, cfg.poena_repetitionis ∷ f32, eog_ids)
+    return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ↦ f32, cfg.top_k, cfg.top_p ↦ f32, cfg.min_p ↦ f32, cfg.poena_repetitionis ↦ f32, eog_ids)
 }
 
 # --- Resident dense model --------------------------------------------------
