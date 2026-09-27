@@ -931,15 +931,15 @@ fn reply_json(server.Incoming incoming, int status, string body) → void {
 }
 
 fn wants_sse(server.Incoming incoming) → bool {
-    const string ∪ null accept ← incoming.req.header("accept")
-    if accept not is null {
+    const string ∪ none accept ← incoming.req.header("accept")
+    if accept not is none {
         const string a ← accept ↦ string
         if a.contains("text/event-stream") {
             return true
         }
     }
-    const string ∪ null stream ← incoming.req.query_field("stream")
-    if stream not is null {
+    const string ∪ none stream ← incoming.req.query_field("stream")
+    if stream not is none {
         const string s ← stream ↦ string
         if s ≡ "1" or s ≡ "true" {
             return true
@@ -1036,7 +1036,7 @@ fn model_size_ceiling() → int {
 # Size gate for admit_model: the refusal diagnostic when `observed` exceeds
 # the ceiling, null when the path may be read whole. Pure so the admission
 # rows can feed it sizes as inputs.
-fn check_admission_size(int observed) → string ∪ null {
+fn check_admission_size(int observed) → string ∪ none {
     if observed > model_size_ceiling() {
         return "model byte length " + (observed ↦ string) + " exceeds the admission ceiling " + (model_size_ceiling() ↦ string)
     }
@@ -1051,11 +1051,11 @@ fn check_admission_size(int observed) → string ∪ null {
 fn admit_model(string path) → string ⇥ gguf.GgufError {
     var string digest ← ""
     var bytes raw ← ||
-    var string ∪ null size_refusal ← null
+    var string ∪ none size_refusal ← null
     do {
         const int size ← host_mensura(path)
         size_refusal ← check_admission_size(size)
-        if size_refusal is null {
+        if size_refusal is none {
             digest ← host_digestio(path)
             raw ← host_hauri(path, model_size_ceiling())
         }
@@ -1063,7 +1063,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     catch err {
         throw variant BadCapsule { message = err }
     }
-    if size_refusal not is null {
+    if size_refusal not is none {
         throw variant BadCapsule { message = size_refusal coalesce "" }
     }
     const list<int<u8>> data ← bytes_as_u8(raw)
@@ -1630,7 +1630,7 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
 # (`gguf.admit` is pinned to the SmolLM2 row) is always bound to one verified
 # file identity — the binding `live_run` has always applied. Pure so the
 # serve rows can feed digests as inputs.
-fn check_pinned_digest(string admitted) → string ∪ null {
+fn check_pinned_digest(string admitted) → string ∪ none {
     if admitted ≠ pinned_digest() {
         return "model digest " + admitted + " is not the pinned row digest " + pinned_digest()
     }
@@ -1643,7 +1643,7 @@ fn check_pinned_digest(string admitted) → string ∪ null {
 # unset — the flag adds no constraint of its own; the pinned-row binding is
 # `check_pinned_digest` above. Pure so the serve rows can feed digests as
 # inputs.
-fn check_expected_digest(string admitted, string expected) → string ∪ null {
+fn check_expected_digest(string admitted, string expected) → string ∪ none {
     if expected ≡ "" {
         return null
     }
@@ -1658,7 +1658,7 @@ fn check_expected_digest(string admitted, string expected) → string ∪ null {
 # weights. The refusal covers the admit → load TOCTOU (materialized ≠
 # admitted) and the --expected-digest pin carried from serve; null lets
 # load_resident_weights read. Pure so the rows feed digests as inputs.
-fn check_materialized_digest(string admitted, string materialized, string expected) → string ∪ null {
+fn check_materialized_digest(string admitted, string materialized, string expected) → string ∪ none {
     if materialized ≠ admitted {
         return "model changed between admission and materialization: admitted=" + admitted + " materialized=" + materialized
     }
@@ -1683,8 +1683,8 @@ fn load_resident_model(string path, string sha, string expected_digest) → Resi
     catch err {
         throw variant BadCapsule { message = err }
     }
-    const string ∪ null refusal ← check_materialized_digest(sha, materialized, expected_digest)
-    if refusal not is null {
+    const string ∪ none refusal ← check_materialized_digest(sha, materialized, expected_digest)
+    if refusal not is none {
         throw variant BadCapsule { message = refusal coalesce "" }
     }
     return load_resident_weights(path, admitted)
@@ -2063,7 +2063,7 @@ static int MAX_PROMPT_LENGTH = 65536
 # Size gate for the /generate prompt: the refusal diagnostic when the prompt
 # exceeds MAX_PROMPT_LENGTH, null when the prompt may flow to encode. Pure so
 # the gate rows can feed it prompts as inputs.
-fn check_prompt_length(string prompt) → string ∪ null {
+fn check_prompt_length(string prompt) → string ∪ none {
     if prompt.length() > MAX_PROMPT_LENGTH {
         return "prompt length " + (prompt.length() ↦ string) + " exceeds the bound " + (MAX_PROMPT_LENGTH ↦ string)
     }
@@ -2118,8 +2118,8 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
     }
     # Pre-encode prompt-length gate (S-F4): reject over-bound prompts before
     # the encode call; in-bound requests take the same path as before.
-    const string ∪ null too_long ← check_prompt_length(parsed.prompt)
-    if too_long not is null {
+    const string ∪ none too_long ← check_prompt_length(parsed.prompt)
+    if too_long not is none {
         reply_json(incoming, 400, error_body(too_long coalesce ""))
         return
     }
@@ -2204,12 +2204,12 @@ fn serve(ServeConfig config) → void {
     var ServerState state ← new_state(config.model)
     do {
         const string sha ← admit_model(state.model_path)
-        const string ∪ null pin_refusal ← check_pinned_digest(sha)
-        if pin_refusal not is null {
+        const string ∪ none pin_refusal ← check_pinned_digest(sha)
+        if pin_refusal not is none {
             throw variant BadCapsule { message = pin_refusal coalesce "" }
         }
-        const string ∪ null digest_refusal ← check_expected_digest(sha, config.expected_digest)
-        if digest_refusal not is null {
+        const string ∪ none digest_refusal ← check_expected_digest(sha, config.expected_digest)
+        if digest_refusal not is none {
             throw variant BadCapsule { message = digest_refusal coalesce "" }
         }
         state ← admitted(state, sha)
@@ -2708,27 +2708,27 @@ describe "admission size ceiling" tag "inferentia" {
         # The gate is pure so the rows feed sizes as inputs: admission refuses
         # an over-ceiling path before host_hauri runs (admit_model only reaches
         # the read when the gate returns null), and the pinned size passes.
-        assert check_admission_size(model_file_size_bytes()) is null
+        assert check_admission_size(model_file_size_bytes()) is none
         assert model_size_ceiling() ≡ model_file_size_bytes()
     }
     test "one byte over the pinned size is refused with the size diagnostic" {
-        const string ∪ null refusal ← check_admission_size(model_file_size_bytes() + 1)
-        assert refusal not is null
+        const string ∪ none refusal ← check_admission_size(model_file_size_bytes() + 1)
+        assert refusal not is none
         assert (refusal coalesce "").contains((model_file_size_bytes() + 1) ↦ string)
         assert (refusal coalesce "").contains(model_file_size_bytes() ↦ string)
     }
 }
 describe "generate prompt length gate" tag "inferentia" {
     test "in-bound prompt passes the gate" {
-        assert check_prompt_length("hello") is null
+        assert check_prompt_length("hello") is none
     }
     test "prompt at the bound passes the gate" {
-        assert check_prompt_length(prompt_of_length(MAX_PROMPT_LENGTH)) is null
+        assert check_prompt_length(prompt_of_length(MAX_PROMPT_LENGTH)) is none
     }
     test "prompt one over the bound is refused with the size diagnostic" {
         const int n ← MAX_PROMPT_LENGTH + 1
-        const string ∪ null refusal ← check_prompt_length(prompt_of_length(n))
-        assert refusal not is null
+        const string ∪ none refusal ← check_prompt_length(prompt_of_length(n))
+        assert refusal not is none
         assert (refusal coalesce "").contains(n ↦ string)
         assert (refusal coalesce "").contains(MAX_PROMPT_LENGTH ↦ string)
     }
@@ -2756,8 +2756,8 @@ describe "http module" tag "inferentia" {
     }
     test "json headers carry content-type" {
         const headers.Headers head ← json_headers()
-        const string ∪ null ct ← head.get("content-type")
-        assert ct not is null
+        const string ∪ none ct ← head.get("content-type")
+        assert ct not is none
         assert (ct ↦ string) ≡ "application/json"
     }
     test "incoming_of splits stream query and wants sse" {
@@ -2791,13 +2791,13 @@ describe "http module" tag "inferentia" {
 }
 describe "serve admission digest" tag "inferentia" {
     test "the pinned row digest passes the serve admission pin" {
-        assert check_pinned_digest(pinned_digest()) is null
+        assert check_pinned_digest(pinned_digest()) is none
     }
     test "a digest that is not the pinned row is refused on serve" {
         # S-F1: serve binds admission to the pinned row like live_run, so a
         # structure-valid file with other weights never reaches `ready`.
-        const string ∪ null refusal ← check_pinned_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
-        assert refusal not is null
+        const string ∪ none refusal ← check_pinned_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert refusal not is none
         assert (refusal coalesce "").contains("0000f013")
         assert (refusal coalesce "").contains(pinned_digest())
     }
@@ -2806,40 +2806,40 @@ describe "serve admission digest" tag "inferentia" {
         # pinned-row binding is the separate check_pinned_digest gate above.
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
         assert cfg.expected_digest ≡ ""
-        assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
-        assert check_expected_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
+        assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is none
+        assert check_expected_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is none
     }
     test "set flag binds from the cli" {
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
         assert cfg.expected_digest ≡ "2fa3f013"
     }
     test "matching digest passes the admission gate" {
-        assert check_expected_digest("2fa3f013", "2fa3f013") is null
+        assert check_expected_digest("2fa3f013", "2fa3f013") is none
     }
     test "mismatching digest is refused with the pin diagnostic" {
         # Clause 2: the refusal is the thrown cause, which serve's catch maps
         # into the failed state — admission never reaches `ready`, so the
         # model is never served and there is no panic path.
-        const string ∪ null refusal ← check_expected_digest("aaaa", "bbbb")
-        assert refusal not is null
+        const string ∪ none refusal ← check_expected_digest("aaaa", "bbbb")
+        assert refusal not is none
         assert (refusal coalesce "").contains("aaaa")
         assert (refusal coalesce "").contains("bbbb")
     }
     test "file swapped between admit and materialization is caught" {
         # Clause 3: the re-verify at load time compares against the admitted
         # sha, so swapped bytes throw before load_resident_weights reads.
-        const string ∪ null refusal ← check_materialized_digest("admitted-sha", "swapped-sha", "")
-        assert refusal not is null
+        const string ∪ none refusal ← check_materialized_digest("admitted-sha", "swapped-sha", "")
+        assert refusal not is none
         assert (refusal coalesce "").contains("admitted-sha")
         assert (refusal coalesce "").contains("swapped-sha")
     }
     test "materialized digest equal to admitted passes, with or without the flag" {
-        assert check_materialized_digest("same-sha", "same-sha", "") is null
-        assert check_materialized_digest("same-sha", "same-sha", "same-sha") is null
+        assert check_materialized_digest("same-sha", "same-sha", "") is none
+        assert check_materialized_digest("same-sha", "same-sha", "same-sha") is none
     }
     test "materialized digest mismatching the flag is caught" {
-        const string ∪ null refusal ← check_materialized_digest("same-sha", "same-sha", "flag-sha")
-        assert refusal not is null
+        const string ∪ none refusal ← check_materialized_digest("same-sha", "same-sha", "flag-sha")
+        assert refusal not is none
         assert (refusal coalesce "").contains("flag-sha")
     }
 }
