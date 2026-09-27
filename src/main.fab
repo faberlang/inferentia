@@ -1624,11 +1624,25 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
     }
 }
 
-# Digest gate for serve admission (G1-U9): the refusal diagnostic when the
-# admitted digest does not match the operator-supplied --expected-digest,
-# null when admission proceeds. An empty expected means unset — serve exists
-# to load arbitrary models, so an unset flag keeps today's behavior. Pure so
-# the serve rows can feed digests as inputs.
+# Pinned-row digest gate for serve admission (S-F1): the refusal diagnostic
+# when the admitted digest is not the pinned row's, null when it is. `serve`
+# runs this before the operator pin, so the structural admission contract
+# (`gguf.admit` is pinned to the SmolLM2 row) is always bound to one verified
+# file identity — the binding `live_run` has always applied. Pure so the
+# serve rows can feed digests as inputs.
+fn check_pinned_digest(string admitted) → string ∪ null {
+    if admitted ≠ pinned_digest() {
+        return "model digest " + admitted + " is not the pinned row digest " + pinned_digest()
+    }
+    return null
+}
+
+# Operator digest gate for serve admission (G1-U9): the refusal diagnostic
+# when the admitted digest does not match the operator-supplied
+# --expected-digest, null when admission proceeds. An empty expected means
+# unset — the flag adds no constraint of its own; the pinned-row binding is
+# `check_pinned_digest` above. Pure so the serve rows can feed digests as
+# inputs.
 fn check_expected_digest(string admitted, string expected) → string ∪ null {
     if expected ≡ "" {
         return null
@@ -2180,17 +2194,20 @@ fn accept_loop_step(bool serving, string err) → bool {
 fn serve(ServeConfig config) → void {
     # U2 admission ordering: bind first, then admit BEFORE any allocation.
     # admit computes the whole-file digest and pins the pinned-row structure
-    # (BD-2 gate) — gguf.admit receives the digest but never compares it
-    # against a pin. Digest verification lives in the live pin (live_run),
-    # the optional --expected-digest flag checked here at admission, and the
-    # materialization re-verify in load_resident_model (admit → load TOCTOU).
-    # Weight materialization is out of this path: never forward/generate.
+    # (BD-2 gate); serve then binds that digest to the pinned row (S-F1) and
+    # to any operator --expected-digest, and load_resident_model re-verifies
+    # at materialization (admit → load TOCTOU). Weight materialization is out
+    # of this path: never forward/generate.
     const server.Listener listener ← server.bind(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
     do {
         const string sha ← admit_model(state.model_path)
+        const string ∪ null pin_refusal ← check_pinned_digest(sha)
+        if pin_refusal not is null {
+            throw variant BadCapsule { message = pin_refusal coalesce "" }
+        }
         const string ∪ null digest_refusal ← check_expected_digest(sha, config.expected_digest)
         if digest_refusal not is null {
             throw variant BadCapsule { message = digest_refusal coalesce "" }
@@ -2772,10 +2789,21 @@ describe "http module" tag "inferentia" {
         assert wants_sse(incoming)
     }
 }
-describe "serve expected digest" tag "inferentia" {
-    test "unset flag keeps today's behavior: any admitted digest passes" {
-        # Default unset (G1-U9 clause 1): serve exists to load arbitrary
-        # models, so the admission gate returns null for every digest.
+describe "serve admission digest" tag "inferentia" {
+    test "the pinned row digest passes the serve admission pin" {
+        assert check_pinned_digest(pinned_digest()) is null
+    }
+    test "a digest that is not the pinned row is refused on serve" {
+        # S-F1: serve binds admission to the pinned row like live_run, so a
+        # structure-valid file with other weights never reaches `ready`.
+        const string ∪ null refusal ← check_pinned_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert refusal not is null
+        assert (refusal coalesce "").contains("0000f013")
+        assert (refusal coalesce "").contains(pinned_digest())
+    }
+    test "unset flag adds no operator pin of its own" {
+        # Default unset (G1-U9 clause 1): the flag adds no constraint; the
+        # pinned-row binding is the separate check_pinned_digest gate above.
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
         assert cfg.expected_digest ≡ ""
         assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is null
