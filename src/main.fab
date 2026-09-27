@@ -833,13 +833,47 @@ fn generate_response_body(ServerState st, string text, list<int> tokens, list<in
     return "{\"model\":{\"sha256\":\"" + json_escape(st.sha256) + "\",\"path\":\"" + json_escape(st.model_path) + "\"},\"text\":\"" + json_escape(text) + "\",\"tokens\":" + tokens_json(tokens) + ",\"finish_reason\":\"" + reason + "\",\"usage\":{\"prompt_tokens\":" + (pn ↦ string) + ",\"completion_tokens\":" + (cn ↦ string) + ",\"total_tokens\":" + (total ↦ string) + "}}"
 }
 
-# JSON-string escape for health/error bodies (typed causes carry quotes,
-# e.g. unknown config field "bogus"; a configured model path may carry
-# backslashes; multi-line error text carries control characters). Escaping
-# order matters: backslashes first, then quotes, then control characters —
-# reversing the first two would double the inserted backslashes.
+# JSON-string escape for health/error/generate bodies (typed causes carry
+# quotes, e.g. unknown config field "bogus"; a configured model path may
+# carry backslashes; decoded model text carries arbitrary control bytes).
+# JSON requires every U+0000..U+001F code point escaped. A replace chain
+# cannot express that: it saw only the named controls, so \b, \f, \v and the
+# rest of the C0 range went out raw and a one-byte vocab token produced
+# invalid JSON (S-F5). The escape set and short forms mirror the canonical
+# serializer (`norma:json/lexer` escape_char/control_escape).
 fn json_escape(string s) → string {
-    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    var string out ← ""
+    var int i ← 0
+    while i < s.length() {
+        out ← out + json_escape_char(s.slice(i, i + 1))
+        i ← i + 1
+    }
+    return out
+}
+
+# One character as an escaped fragment. A character is a length-1 string, so
+# the C0 test reads its single UTF-8 byte; multi-byte characters pass
+# through unchanged.
+fn json_escape_char(string c) → string {
+    if c ≡ "\\" { return "\\\\" }
+    if c ≡ "\"" { return "\\\"" }
+    if c ≡ "\n" { return "\\n" }
+    if c ≡ "\r" { return "\\r" }
+    if c ≡ "\t" { return "\\t" }
+    const bytes encoded ← c ↦ bytes
+    if encoded.length() ≡ 1 {
+        const int code ← (encoded.get(0) coalesce (0 ∷ int<u8>)) ↦ int
+        if code ≡ 8 { return "\\b" }
+        if code ≡ 12 { return "\\f" }
+        if code < 32 {
+            return "\\u00" + json_hex_digit(code / 16) + json_hex_digit(code % 16)
+        }
+    }
+    return c
+}
+
+fn json_hex_digit(int digit) → string {
+    return "0123456789abcdef".slice(digit, digit + 1)
 }
 
 fn error_body(string error) → string {
@@ -2369,6 +2403,16 @@ describe "health lifecycle" tag "inferentia" {
     }
     test "json escape escapes control characters" {
         assert json_escape("line1\nline2\tend") ≡ "line1\\nline2\\tend"
+    }
+    test "json escape maps the remaining C0 controls to escapes and \\u00XX" {
+        # S-F5: \b, \f, \v and the rest of U+0000..U+001F were emitted raw, so
+        # a one-byte vocab token produced invalid JSON. The fixtures are
+        # byte-built: a source `\b` / `\f` is not the C0 character.
+        assert json_escape(([8] ↦ bytes) ↦ string) ≡ "\\b"
+        assert json_escape(([12] ↦ bytes) ↦ string) ≡ "\\f"
+        assert json_escape(([1] ↦ bytes) ↦ string) ≡ "\\u0001"
+        assert json_escape(([31] ↦ bytes) ↦ string) ≡ "\\u001f"
+        assert json_escape("λ") ≡ "λ"
     }
     test "health body ready escapes quotes and backslashes in the path" {
         const ServerState st ← admitted(new_state("/models/a\"b\\c.gguf"), "2fa3f013")
