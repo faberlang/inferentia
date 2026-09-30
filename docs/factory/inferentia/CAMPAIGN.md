@@ -2,6 +2,12 @@
 
 **Status**: active — I1 delivery admitted (auditor-4 d9fb5375); U1/U2/U3/U4/U5/U7 + D5-exit fix landed; remaining Slice-1 = U6/U8; provider ruling 2615e6a9 (A): gradus owns admit/tokenize/generate as `gradus:*` — I-1/I-2 remapped inferentia off deleted `faber-runtime/model`; BD-1 now G3 `tokenize` (tables not yet loaded from the admitted row — frozen-fixture fallback remains); BD-3 deferred; BD-4 open
 
+> **gpu-reset note (2026-09-29).** This goal stays active but must conform to
+> `radix/docs/factory/gpu-reset/CAMPAIGN.md` settled rules 9–18 (kernels as pure
+> calls, `filum`/`reducta`, runtime extents, implicit residency, logical devices,
+> portable profile). Pre-2026-09-29 GPU goal docs are not authority. The CPU slice may continue; the GPU intent now lives in gpu-reset acceptance program A1.
+
+
 ## Summary
 
 Build Inferentia as a Faber-written, local-first GGUF inference server. Deliver
