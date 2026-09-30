@@ -901,7 +901,7 @@ fn classify_generate_error(string err) → int {
 # for a failed octeti→text decode (invalid UTF-8).
 fn request_body_text(value body_value) → string {
     if body_value is string {
-        return body_value ↦ string
+        return body_value ↦ string ⊥ body_read_gap_marker()
     }
     const bytes raw ← body_value ↦ bytes ⊥ ||
     return raw ↦ string ⊥ body_read_gap_marker()
@@ -909,7 +909,8 @@ fn request_body_text(value body_value) → string {
 
 fn request_body_from_raw(value request) → string {
     if request is map<string, value> {
-        const map<string, value> tab ← request ↦ map<string, value>
+        # Guarded by the `is` test, so the default never applies.
+        const map<string, value> tab ← request ↦ map<string, value> ⊥ empty
         return request_body_text(tab.get("body"))
     }
     return body_read_gap_marker()
@@ -1517,7 +1518,13 @@ fn inspect_model(string path, string sha) → gguf_manifest.GgufManifest {
         panic "table-prefix read was short"
     }
     const value prefix_valor ← prefix_bytes ↦ value
-    const list<int> prefix ← prefix_valor ↦ list<int>
+    var list<int> prefix ← []
+    do {
+        prefix ← prefix_valor ↦ list<int>
+    }
+    catch err {
+        panic "table-prefix carrier was not a byte list: " + err
+    }
     const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
         algorithm = "sha-256",
         digest = sha,
@@ -2425,10 +2432,10 @@ describe "health lifecycle" tag "inferentia" {
         # S-F5: \b, \f, \v and the rest of U+0000..U+001F were emitted raw, so
         # a one-byte vocab token produced invalid JSON. The fixtures are
         # byte-built: a source `\b` / `\f` is not the C0 character.
-        assert json_escape(([8] ↦ bytes) ↦ string) ≡ "\\b"
-        assert json_escape(([12] ↦ bytes) ↦ string) ≡ "\\f"
-        assert json_escape(([1] ↦ bytes) ↦ string) ≡ "\\u0001"
-        assert json_escape(([31] ↦ bytes) ↦ string) ≡ "\\u001f"
+        assert json_escape(([8] ↦ bytes) ↦ string ⊥ "") ≡ "\\b"
+        assert json_escape(([12] ↦ bytes) ↦ string ⊥ "") ≡ "\\f"
+        assert json_escape(([1] ↦ bytes) ↦ string ⊥ "") ≡ "\\u0001"
+        assert json_escape(([31] ↦ bytes) ↦ string ⊥ "") ≡ "\\u001f"
         assert json_escape("λ") ≡ "λ"
     }
     test "health body ready escapes quotes and backslashes in the path" {
