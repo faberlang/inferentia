@@ -862,7 +862,7 @@ fn json_escape_char(string c) → string {
     if c ≡ "\t" { return "\\t" }
     const bytes encoded ← c ↦ bytes
     if encoded.length() ≡ 1 {
-        const int code ← (encoded.get(0) coalesce (0 ∷ int<u8>)) ↦ int
+        const int code ← (encoded.get(0) coalesce (0 ∷ u8)) ↦ int
         if code ≡ 8 { return "\\b" }
         if code ≡ 12 { return "\\f" }
         if code < 32 {
@@ -1002,11 +1002,11 @@ fn pinned_expect_q5() → int { return 176 }
 fn pinned_expect_q6() → int { return 16 }
 fn pinned_expect_q8() → int { return 17 }
 
-fn bytes_as_u8(bytes raw) → list<int<u8>> {
-    var list<int<u8>> out ← []
+fn bytes_as_u8(bytes raw) → list<u8> {
+    var list<u8> out ← []
     var int i ← 0
     while i < raw.length() {
-        out.append(raw.get(i) coalesce (0 ∷ int<u8>))
+        out.append(raw.get(i) coalesce (0 ∷ u8))
         i ← i + 1
     }
     return out
@@ -1067,7 +1067,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     if size_refusal not is none {
         throw variant BadCapsule { message = size_refusal coalesce "" }
     }
-    const list<int<u8>> data ← bytes_as_u8(raw)
+    const list<u8> data ← bytes_as_u8(raw)
     const capsule.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
     return cap.digest()
 }

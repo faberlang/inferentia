@@ -48,11 +48,11 @@ fn exit_with(int code) → void {
     return call 'processus:exi' (code) ↦ void
 }
 
-fn bytes_as_u8(bytes raw) → list<int<u8>> {
-    var list<int<u8>> out ← []
+fn bytes_as_u8(bytes raw) → list<u8> {
+    var list<u8> out ← []
     var int i ← 0
     while i < raw.length() {
-        out.append(raw.get(i) coalesce (0 ∷ int<u8>))
+        out.append(raw.get(i) coalesce (0 ∷ u8))
         i ← i + 1
     }
     return out
@@ -79,7 +79,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     catch err {
         throw variant CapsulaMala { message = err }
     }
-    const list<int<u8>> data ← bytes_as_u8(raw)
+    const list<u8> data ← bytes_as_u8(raw)
     const capsule.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
     return cap.digest()
 }
