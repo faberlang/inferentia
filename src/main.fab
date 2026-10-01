@@ -2065,7 +2065,7 @@ fn handle_model(server.Incoming incoming, ServerState st, ServeConfig config) â†
 # encode. The gate is a text-length bound in the runtime string-length unit;
 # the HTTP body cap stays the outer bound and max_prompt keeps its
 # post-encode generation meaning.
-static int MAX_PROMPT_LENGTH = 65536
+const int MAX_PROMPT_LENGTH = 65536
 
 # Size gate for the /generate prompt: the refusal diagnostic when the prompt
 # exceeds MAX_PROMPT_LENGTH, null when the prompt may flow to encode. Pure so
