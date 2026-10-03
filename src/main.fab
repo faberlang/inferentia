@@ -2773,7 +2773,8 @@ describe "http module" tag "inferentia" {
         raw.put("connection", 1 ↦ value)
         raw.put("method", "POST" ↦ value)
         raw.put("path", "/generate?stream=1" ↦ value)
-        raw.put("headers", [] ↦ value)
+        const list<value> hdrs ← []
+        raw.put("headers", hdrs ↦ value)
         raw.put("body", "" ↦ value)
         const server.Incoming incoming ← server.incoming_of(raw ↦ value)
         assert incoming.req.path ≡ "/generate"
