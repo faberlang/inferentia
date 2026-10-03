@@ -46,7 +46,14 @@ CONTAINER="$(cd .. && pwd)"
 FABER_BIN="$CONTAINER/radix/target/debug/faber"
 FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" check "$(pwd)"
 FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" build "$(pwd)"
+FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" test "$(pwd)"
 ```
+
+Measured package-suite baseline (2026-10-03, isolated `inf1` packet):
+`faber test <absolute-package-path>` took 157.74s with the plain development
+CLI and 82.08s with a CLI built using `CARGO_PROFILE_DEV_OPT_LEVEL=1`.
+These measure the MIR package suite, not model serving or GPU throughput.
+In a packet, set `CONTAINER` to the packet root so its sibling libraries are used.
 
 Model-serving stages must record the exact model path, size, hash, GGUF
 metadata, command, request fixture, observed output, and comparison oracle.
