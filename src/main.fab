@@ -2476,39 +2476,6 @@ fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.
     )
 }
 
-# RoPE pairing. The GGUF q/k weights are stored for llama.cpp's NORM rope
-# (consecutive pairs (2p, 2p+1) inside a head); the gradus `rope_half` launch
-# rotates the pairs (p, p + 32). Permuting the 64 rows of every head of wq and
-# wk as new[p] = old[2p], new[32 + p] = old[2p + 1] makes the half-split rotation
-# on the permuted projections equal the consecutive rotation on the originals
-# (the same permutation applies to q and k, so q . k is unchanged; v and o are
-# untouched). The permuted copies are built on the device at the start of each
-# generation (64 launches), the loaded weights are not modified.
-fn port_rope_perm() → list<int> {
-    var list<int> out ← []
-    var int p ← 0
-    while p ≺ 32 {
-        out.append(2 * p)
-        p ← p + 1
-    }
-    p ← 0
-    while p ≺ 32 {
-        out.append(2 * p + 1)
-        p ← p + 1
-    }
-    return out
-}
-
-# out[i, j] = src[(i / 64) * 64 + perm[i % 64], j]: the within-head row permutation.
-@ kernel
-@ public
-fn permute_head_rows<size R, size D, size P>(tensor<f32, [R, D]> phsrc, tensor<i32, [P]> phperm, mut tensor<f32, [R, D]> phout) → void {
-    for from phsrc at [i, j] thread lane const v {
-        const int base ← (i / 64) * 64
-        phout[[i, j]] ← phsrc[[base + (phperm[i % 64] ↦ int), j]]
-    }
-}
-
 # Greedy generation. `prompt` must hold at least one id and fewer than
 # `context`; `max_new` >= 1; the caller validates both (main.fab). `eog_ids` is
 # the admitted tokenizer's EOG set; with `stop_on_eog` false the EOG ids are
@@ -2523,6 +2490,9 @@ fn port_generate(PortWeights w, list<int> prompt, int max_new, list<int> eog_ids
     const i32 pdh ← port_i32(64)
     const i32 pspan ← port_i32(32)
     const i32 pgroup ← port_i32(3)
+    # The GGUF q/k weights are stored for llama.cpp's NORM rope (consecutive pairs
+    # (2p, 2p + 1)): rope convention 1 (gradus `rope_pairs`), weights used as stored.
+    const i32 prope ← port_i32(1)
     const i32 pc ← port_i32(c)
     const f32 eps ← 0.00001 ∷ f32
     const f32 lntheta ← 11.512925 ∷ f32
@@ -2546,28 +2516,6 @@ fn port_generate(PortWeights w, list<int> prompt, int max_new, list<int> eog_ids
     }
 
     const tensor<f32, [49152, 960]> emb ← w.embed
-    var tensor<i32, [64]> perm ← tensor<i32, [64]> {}
-    const list<int> perm_rows ← port_rope_perm()
-    var int pi ← 0
-    while pi ≺ 64 {
-        perm[pi] ← port_i32(perm_rows.get(pi) coalesce 0)
-        pi ← pi + 1
-    }
-    var list<tensor<f32, [960, 960]>> wqp ← empty
-    var list<tensor<f32, [320, 960]>> wkp ← empty
-    var int pl0 ← 0
-    while pl0 ≺ PORT_LAYERS {
-        const PortLayer src ← w.layers[pl0]
-        const tensor<f32, [960, 960]> srcq ← src.wq
-        const tensor<f32, [320, 960]> srck ← src.wk
-        var tensor<f32, [960, 960]> outq ← tf32[960, 960] {}
-        var tensor<f32, [320, 960]> outk ← tf32[320, 960] {}
-        permute_head_rows(srcq, perm, mut outq)
-        permute_head_rows(srck, perm, mut outk)
-        wqp.append(outq)
-        wkp.append(outk)
-        pl0 ← pl0 + 1
-    }
     const tensor<f32, [960]> onorm ← w.out_norm
     var tensor<f32, [15]> hdom ← tf32[15] {}
     var tensor<i32, [1]> ids ← tensor<i32, [1]> {}
@@ -2588,8 +2536,8 @@ fn port_generate(PortWeights w, list<int> prompt, int max_new, list<int> eog_ids
         while ll ≺ PORT_LAYERS {
             const PortLayer pl ← w.layers[ll]
             const tensor<f32, [960]> lan ← pl.attn_norm
-            const tensor<f32, [960, 960]> lq ← wqp[ll]
-            const tensor<f32, [320, 960]> lk ← wkp[ll]
+            const tensor<f32, [960, 960]> lq ← pl.wq
+            const tensor<f32, [320, 960]> lk ← pl.wk
             const tensor<f32, [320, 960]> lv ← pl.wv
             const tensor<f32, [960, 960]> lo ← pl.wo
             const tensor<f32, [960]> lfn ← pl.ffn_norm
@@ -2607,7 +2555,7 @@ fn port_generate(PortWeights w, list<int> prompt, int max_new, list<int> eog_ids
                 vin ← vb[ll]
                 vout ← va[ll]
             }
-            dt.layer_step(hdom, hcur, mut hn, lan, lq, lk, lv, lo, lfn, lg, lu, ld, kin, mut kout, vin, mut vout, pos, pd, pqd, pf, pc, pdh, pspan, pgroup, eps, lntheta, attscale)
+            dt.layer_step(hdom, hcur, mut hn, lan, lq, lk, lv, lo, lfn, lg, lu, ld, kin, mut kout, vin, mut vout, pos, pd, pqd, pf, pc, pdh, pspan, pgroup, eps, lntheta, attscale, prope)
             hcur ← hn
             ll ← ll + 1
         }
@@ -3473,29 +3421,6 @@ describe "serve cli parse" tag "inferentia" {
         const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--ignore-eos"])
         assert cfg.ignore_eos
         assert effective_prompt(cfg) ≡ frozen_prompt_text()
-    }
-}
-describe "port rope permutation" tag "inferentia" {
-    test "the permutation lists the even rows then the odd rows of a head" {
-        const list<int> p ← port_rope_perm()
-        assert p.length() ≡ 64
-        assert (p.get(0) coalesce -1) ≡ 0
-        assert (p.get(1) coalesce -1) ≡ 2
-        assert (p.get(31) coalesce -1) ≡ 62
-        assert (p.get(32) coalesce -1) ≡ 1
-        assert (p.get(33) coalesce -1) ≡ 3
-        assert (p.get(63) coalesce -1) ≡ 63
-    }
-    test "the permutation is a bijection of 0..63" {
-        const list<int> p ← port_rope_perm()
-        var int total ← 0
-        var int i ← 0
-        while i ≺ 64 {
-            total ← total + (p.get(i) coalesce 0)
-            assert (p.get(i) coalesce -1) ∈ p
-            i ← i + 1
-        }
-        assert total ≡ 2016
     }
 }
 describe "backend selection cli parse" tag "inferentia" {
