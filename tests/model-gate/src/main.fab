@@ -32,7 +32,7 @@
 #   size 1,449,071,040 bytes, sha256
 #   07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0
 
-import from "gradus:model/capsule" capsula
+import from "gradus:model/capsule" capsule
 import from "norma:console" console
 import from "norma:process" proc
 import from "norma:fs" fsys
@@ -67,7 +67,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     const int observed ← fsys.byte_length(path)
     const bytes raw ← fsys.read_range(path, 0, pinned_data_offset())
     const list<u8> prefix ← raw ↦ list<u8>
-    const capsula.Capsule cap ← gguf.admit(prefix, digest, observed, 0, 0, 30, 290, 361821120, 290, 0, 0, 0, 0)
+    const capsule.Capsule cap ← gguf.admit(prefix, digest, observed, 0, 0, 30, 290, 361821120, 290, 0, 0, 0, 0)
     return cap.digest()
 }
 
@@ -145,7 +145,7 @@ main args argv {
     }
     catch err {
         raised ← true
-        raise_error ← gguf.message(err)
+        raise_error ← err.message
     }
     if raised {
         fail("admit raised: " + raise_error)

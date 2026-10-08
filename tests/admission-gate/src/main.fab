@@ -98,7 +98,7 @@ main args argv {
         }
     }
     catch err {
-        stdout_write("rejected: " + gguf.message(err) + "\n")
+        stdout_write("rejected: " + err.message + "\n")
         exit_with(2)
     }
 }

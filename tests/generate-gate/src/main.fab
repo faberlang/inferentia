@@ -34,7 +34,7 @@ import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
-import from "norma:solum" solum
+import from "norma:fs" fsys
 import from "norma:console" console
 import from "norma:process" proc
 
@@ -117,9 +117,9 @@ fn to_generation(GenerateConfig cfg, list<int> eog_ids) → config.GenerationCon
 class ResidentModel {
     var bool ready
     var dense_gen.DenseEngine engine
-    var tensor.Tensor embed
-    var tensor.Tensor norm_s
-    var list<list<tensor.Tensor>> strata
+    var tensor.NumericBlock embed
+    var tensor.NumericBlock norm_s
+    var list<list<tensor.NumericBlock>> strata
     var structure.KVStructure structure
     var list<int> eog_ids
 }
@@ -137,31 +137,31 @@ fn empty_resident() → ResidentModel {
 }
 
 fn file_size(string path) → int {
-    return solum.byte_length(path)
+    return fsys.byte_length(path)
 }
 
 fn read_range(string path, int start, int length) → bytes {
-    return solum.read_range(path, start, length)
+    return fsys.read_range(path, start, length)
 }
 
-fn source_range(string path, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
+fn source_range(string path, int total, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
     if initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
+        throw variant BadSource { message = "range request exceeds the artifact" }
     }
     const bytes raw ← read_range(path, initium, longitudo)
     if raw.length() ≠ longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "short range read" }
+        throw variant BadSource { message = "short range read" }
     }
-    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
+    return raw
 }
 
-fn prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
+fn prefix_range(list<int> prefix, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
     if initium ≺ 0 or longitudo ≺ 0 or initium ≻ prefix.length() - longitudo {
-        return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
+        throw variant BadSource { message = "inspection attempted to read the tensor data region" }
     }
     const list<int> segment ← prefix.slice(initium, initium + longitudo)
     const bytes raw ← segment ↦ bytes
-    return gguf_manifest.SourceRead { successus = true, bytes = raw, message = "" }
+    return raw
 }
 
 fn ends(string s, string tail) → bool {
@@ -184,10 +184,10 @@ fn slot(string nomen) → int {
 
 fn block_elements(tensor_view.TensorView v) → int {
     match v.layout {
-        case gguf_manifest.Cognita const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+        case gguf_manifest.Known const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
             return elementa_per_blockum
         }
-        case gguf_manifest.Ignota const typo {
+        case gguf_manifest.Unknown const typo {
             return 0
         }
     }
@@ -202,10 +202,10 @@ fn window(int remaining, int block) → int {
 
 fn limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> {
     do {
-        return gguf_manifest.limes_payloadis(m, gguf_name)
+        return gguf_manifest.payload_limit(m, gguf_name)
     }
     catch err {
-        panic "payload range failed for " + gguf_name + ": " + gguf_manifest.message(err)
+        panic "payload range failed for " + gguf_name + ": " + err.message
     }
 }
 
@@ -214,29 +214,29 @@ fn bind_view(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → t
         return tensor_view.links(m, p)
     }
     catch err {
-        panic "view bind failed for " + p.name + ": " + tensor_view.message(err)
+        panic "view bind failed for " + p.name + ": " + err.message
     }
 }
 
-fn slice_view(tensor_view.TensorView v, int off, int n, (int, int) → gguf_manifest.SourceRead fons) → list<f32> {
+fn slice_view(tensor_view.TensorView v, int off, int n, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError fons) → list<f32> {
     do {
         return tensor_view.materialize_slice(v, off, n, fons)
     }
     catch err {
-        panic "window materialize failed for " + v.name + ": " + tensor_view.message(err)
+        panic "window materialize failed for " + v.name + ": " + err.message
     }
 }
 
-fn make_tensor(list<f32> datos, list<int> forma) → tensor.Tensor {
+fn make_tensor(list<f32> datos, list<int> forma) → tensor.NumericBlock {
     do {
         return tensor.construct(datos, forma)
     }
     catch err {
-        panic "tensor construct failed: " + tensor.message(err)
+        panic "tensor construct failed: " + err.message
     }
 }
 
-fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.Tensor {
+fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.NumericBlock {
     const tuple<int, int> limes ← limits(m, gguf_name)
     const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
         name = gguf_name,
@@ -257,7 +257,7 @@ fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_
             v,
             off,
             n,
-            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ source_range(via, total, initium, longitudo)
+            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ source_range(via, total, initium, longitudo)
         )
         var int pi ← 0
         while pi ≺ part.length() {
@@ -288,8 +288,8 @@ fn gguf_name(string family, int stratum) → string {
     panic "unknown canonical tensor name: " + family
 }
 
-fn kmajor_to_linear(tensor.Tensor t) → tensor.Tensor {
-    const list<int> f ← t.shape()
+fn kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock {
+    const list<int> f ← t.shape
     if f.length() ≠ 2 {
         panic "linear weight must be rank 2"
     }
@@ -320,32 +320,32 @@ fn linear_family(string family) → bool {
     return false
 }
 
-fn load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.Tensor {
+fn load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.NumericBlock {
     const string name ← gguf_name(family, stratum)
-    const tensor.Tensor stored ← materialize(via, total, m, name)
+    const tensor.NumericBlock stored ← materialize(via, total, m, name)
     if linear_family(family) {
         return kmajor_to_linear(stored)
     }
     return stored
 }
 
-fn lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, list<list<tensor.Tensor>> strata) → dense.Lookup {
-    if nomen ≡ "model.embed_tokens" { return dense.Lookup { successus = true, tensorem = embed, message = "" } }
-    if nomen ≡ "model.norm" { return dense.Lookup { successus = true, tensorem = norm_s, message = "" } }
+fn lookup(string nomen, int stratum, tensor.NumericBlock embed, tensor.NumericBlock norm_s, list<list<tensor.NumericBlock>> strata) → tensor.NumericBlock ⇥ dense.DenseError {
+    if nomen ≡ "model.embed_tokens" { return embed }
+    if nomen ≡ "model.norm" { return norm_s }
     if stratum ≺ 0 or stratum ≥ strata.length() {
-        return dense.Lookup { successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string) }
+        throw variant MissingTensor { message = "layer out of range: " + (stratum ↦ string) }
     }
     const int s ← slot(nomen)
     if s ≺ 0 {
-        return dense.Lookup { successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen }
+        throw variant MissingTensor { message = "unknown canonical tensor: " + nomen }
     }
-    var list<tensor.Tensor> missing ← []
-    const list<tensor.Tensor> row ← strata.get(stratum) coalesce missing
+    var list<tensor.NumericBlock> missing ← []
+    const list<tensor.NumericBlock> row ← strata.get(stratum) coalesce missing
     if s ≥ row.length() {
-        return dense.Lookup { successus = false, tensorem = embed, message = "layer slot missing: " + nomen }
+        throw variant MissingTensor { message = "layer slot missing: " + nomen }
     }
-    const tensor.Tensor t ← row.get(s) coalesce embed
-    return dense.Lookup { successus = true, tensorem = t, message = "" }
+    const tensor.NumericBlock t ← row.get(s) coalesce embed
+    return t
 }
 
 fn indices(int n) → list<int> {
@@ -369,30 +369,36 @@ fn inspect_model(string path) → gguf_manifest.GgufManifest {
         panic "table-prefix read was short"
     }
     const value prefix_valor ← prefix_bytes ↦ value
-    const list<int> prefix ← prefix_valor ↦ list<int>
+    var list<int> prefix ← []
+    do {
+        prefix ← prefix_valor ↦ list<int>
+    }
+    catch err {
+        panic "table-prefix carrier was not a byte list: " + err
+    }
     const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
         algorithm = "sha-256",
         digest = pinned_digest(),
         length = total
     }
     var gguf_manifest.GgufManifest admitted ← gguf_manifest.GgufManifest {
-        identitas = identitas,
+        identity = identitas,
         version = 0,
-        concordatio = 0,
-        data_inceptum = 0,
+        alignment = 0,
+        data_start = 0,
         artifact_length = 0,
         metadata = [],
         tensors = []
     }
     do {
         admitted ← gguf_manifest.inspect(
-            (int initium, int longitudo) → gguf_manifest.SourceRead ∴ prefix_range(prefix, initium, longitudo),
+            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ prefix_range(prefix, initium, longitudo),
             total,
             identitas
         )
     }
     catch err {
-        panic "manifest admission failed: " + gguf_manifest.message(err)
+        panic "manifest admission failed: " + err.message
     }
     return admitted
 }
@@ -406,10 +412,10 @@ fn load_resident(string path) → ResidentModel {
         eog_ids ← tokenizator.artifact_eog(tokenizer)
     }
     catch err {
-        panic "tokenizer admission failed: " + tokenizator.message(err)
+        panic "tokenizer admission failed: " + err.message
     }
-    var tensor.Tensor embed ← tensor.default()
-    var tensor.Tensor norm_s ← tensor.default()
+    var tensor.NumericBlock embed ← tensor.default()
+    var tensor.NumericBlock norm_s ← tensor.default()
     embed ← load_one(path, total, admitted, "model.embed_tokens", 0)
     norm_s ← load_one(path, total, admitted, "model.norm", 0)
 
@@ -424,10 +430,10 @@ fn load_resident(string path) → ResidentModel {
         "model.layers.mlp.up_proj",
         "model.layers.mlp.down_proj"
     ]
-    var list<list<tensor.Tensor>> strata ← []
+    var list<list<tensor.NumericBlock>> strata ← []
     var int stratum ← 0
     while stratum ≺ 32 {
-        var list<tensor.Tensor> row ← []
+        var list<tensor.NumericBlock> row ← []
         var int f ← 0
         while f ≺ families.length() {
             row.append(load_one(path, total, admitted, families.get(f) coalesce "", stratum))
@@ -494,7 +500,7 @@ fn fresh_caches(ResidentModel model) → list<kv.KVCache> {
         return dense.empty_caches(model.structure, "smollm2", "360m", "f32-staged", "smollm")
     }
     catch err {
-        panic "empty caches failed: " + dense.message(err)
+        panic "empty caches failed: " + err.message
     }
 }
 
@@ -508,7 +514,7 @@ fn run_generate(GenerateConfig cfg, list<int> prompt, ResidentModel model, decod
         g,
         prompt,
         model.engine,
-        (string n, int s) → dense.Lookup ∴ lookup(n, s, model.embed, model.norm_s, model.strata),
+        (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ lookup(n, s, model.embed, model.norm_s, model.strata),
         layers,
         decode.fresh_cancellation(),
         stop
