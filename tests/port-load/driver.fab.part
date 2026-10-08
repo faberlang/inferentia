@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# Port-load driver (appended to a scratch copy of the package by run.sh; it
+# is NOT part of the inferentia product and adds no CLI flag).
+# Every `driver:` line on stderr is timestamped by run.sh.
+# ---------------------------------------------------------------------------
+fn driver_cell(string label, f32 x) → void {
+    stdout_write("cell " + label + " " + (x ↦ string) + "\n")
+}
+
+fn port_driver(ServeConfig config) → void {
+    stderr_write("driver: start\n")
+    var string sha ← ""
+    do {
+        sha ← admit_model(config.model)
+    }
+    catch err {
+        panic "admit failed: " + err.message
+    }
+    stderr_write("driver: admit-done\n")
+    if sha ≠ pinned_digest() {
+        panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
+    }
+    stdout_write("sha.admitted=" + sha + "\n")
+    const gguf_manifest.GgufManifest admitted ← inspect_model(config.model, sha)
+    stderr_write("driver: inspect-done\n")
+    var string materialized ← ""
+    do {
+        materialized ← host_digestio(config.model)
+    }
+    catch err {
+        panic "digest failed: " + err
+    }
+    stderr_write("driver: digest-done\n")
+    const string ∪ none refusal ← check_materialized_digest(sha, materialized, "")
+    if refusal not is none {
+        panic refusal coalesce ""
+    }
+    stdout_write("sha.materialized=" + materialized + "\n")
+    stdout_write("sha.bound=true\n")
+    do {
+        const port.PortWeights w ← load_port_weights(config.model, admitted)
+        stderr_write("driver: load-done\n")
+        stdout_write("tensors.layers=" + (w.layers.length() ↦ string) + "\n")
+        const port.PortLayer l0 ← w.layers[0]
+        const port.PortLayer l7 ← w.layers[7]
+        const port.PortLayer l15 ← w.layers[15]
+        const port.PortLayer l31 ← w.layers[31]
+        driver_cell("token_embd[30000,17]", w.embed[[30000, 17]])
+        driver_cell("token_embd[49151,959]", w.embed[[49151, 959]])
+        driver_cell("blk0.attn_q[123,456]", l0.wq[[123, 456]])
+        driver_cell("blk0.attn_k[319,959]", l0.wk[[319, 959]])
+        driver_cell("blk31.ffn_down[900,2000]", l31.wd[[900, 2000]])
+        driver_cell("blk15.ffn_gate[2559,0]", l15.wg[[2559, 0]])
+        driver_cell("blk7.attn_norm[500]", l7.attn_norm[[500]])
+        driver_cell("output_norm[959]", w.out_norm[[959]])
+        stderr_write("driver: cells-done\n")
+    }
+    catch err {
+        panic "port load failed: " + err.message
+    }
+}
+
+main args argv {
+    const ServeConfig config ← parse_cli(argv)
+    port_driver(config)
+}

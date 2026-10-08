@@ -71,6 +71,8 @@ import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
 
+import from "./port_weights" port
+
 # ---------------------------------------------------------------------------
 # Serve configuration (D1 syntax + D2 precedence)
 #
@@ -1732,6 +1734,43 @@ fn load_resident_model(string path, string sha, string expected_digest) → Resi
         throw variant BadCapsule { message = refusal coalesce "" }
     }
     return load_resident_weights(path, admitted)
+}
+
+# A1 port load (U-G): every tensor read once and reinterpreted in bulk as a
+# literal-shape tensor (`raw ↦ tensor<f32, [N, K]> via Le`). `path` and the
+# bounds-checked `live_range` are the byte source; the shapes, names and the
+# BadBounds/UnknownLayout refusals live in port_weights.fab.
+fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf_manifest.GgufManifestError {
+    const int total ← live_file_size(path)
+    return port.load_weights(
+        (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(path, total, initium, longitudo),
+        admitted
+    )
+}
+
+# The port path's digest-bound entry: the same admit -> re-digest ->
+# check_materialized_digest sequence as load_resident_model (the file is
+# re-digested after admission and must equal the admitted sha and the
+# operator pin before any weight is read), then load_port_weights.
+fn load_port_model(string path, string sha, string expected_digest) → port.PortWeights ⇥ gguf.GgufError {
+    const gguf_manifest.GgufManifest admitted ← inspect_model(path, sha)
+    var string materialized ← ""
+    do {
+        materialized ← host_digestio(path)
+    }
+    catch err {
+        throw variant BadCapsule { message = err }
+    }
+    const string ∪ none refusal ← check_materialized_digest(sha, materialized, expected_digest)
+    if refusal not is none {
+        throw variant BadCapsule { message = refusal coalesce "" }
+    }
+    do {
+        return load_port_weights(path, admitted)
+    }
+    catch err {
+        throw variant BadCapsule { message = err.message }
+    }
 }
 
 fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
