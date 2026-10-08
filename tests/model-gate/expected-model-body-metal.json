@@ -1,0 +1,1 @@
+{"name":"SmolLM2-360M-Instruct-F32","architecture":"llama","quantization":"f32","file_size_bytes":1449071040,"sha256":"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0","context_length":8192,"vocab_size":49152,"max_output_tokens":32,"backend":"metal"}
