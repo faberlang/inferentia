@@ -1164,8 +1164,12 @@ fn pinned_data_offset() → int {
     return 1786560
 }
 
-fn pinned_slice_cap() → int {
-    return 16777216
+# Elements read from the file per read window. A window's bytes are a value
+# the source closure copies on every sub-range call, so the window must stay
+# small (1024 F32 elements = 4 KiB); the file is still read once per window,
+# not once per block.
+fn live_read_cap() → int {
+    return 1024
 }
 
 # NOTE: the former 16-token ignore_eos golden was Q4_K_M evidence (U5
@@ -1260,8 +1264,8 @@ fn live_block_elements(tensor_view.TensorView v) → int {
 }
 
 fn live_window(int remaining, int block) → int {
-    if remaining ≤ pinned_slice_cap() { return remaining }
-    const int aligned ← (pinned_slice_cap() / block) * block
+    if remaining ≤ live_read_cap() { return remaining }
+    const int aligned ← (live_read_cap() / block) * block
     if aligned ≺ block { return block }
     return aligned
 }
@@ -1302,6 +1306,38 @@ fn live_tensor(list<f32> datos, list<int> forma) → tensor.NumericBlock {
     }
 }
 
+fn live_block_bytes(tensor_view.TensorView v) → int {
+    match v.layout {
+        case gguf_manifest.Known const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
+            return octeti_per_blockum
+        }
+        case gguf_manifest.Unknown const typo {
+            return 0
+        }
+    }
+}
+
+# Serve one sub-range request from the bytes of an already-read window.
+# `base` is the absolute file offset of window[0]; a request outside the
+# window fails closed as BadSource (the window is exactly the range the
+# slice will ask for, so this only fires on a caller bug).
+fn live_window_range(bytes window, int base, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
+    const int rel ← initium - base
+    if rel ≺ 0 or longitudo ≺ 0 or rel + longitudo ≻ window.length() {
+        throw variant BadSource { message = "range request exceeds the read window" }
+    }
+    return window[rel‥(rel + longitudo)]
+}
+
+fn live_read_window(string via, int total, int base, int longitudo, string gguf_name) → bytes {
+    do {
+        return live_range(via, total, base, longitudo)
+    }
+    catch err {
+        panic "window read failed for " + gguf_name + ": " + err.message
+    }
+}
+
 fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.NumericBlock {
     const tuple<int, int> limes ← live_limits(m, gguf_name)
     const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
@@ -1312,18 +1348,23 @@ fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string 
     }
     const tensor_view.TensorView v ← live_bind(m, p)
     const int block ← live_block_elements(v)
-    if block ≺ 1 {
+    const int block_bytes ← live_block_bytes(v)
+    if block ≺ 1 or block_bytes ≺ 1 {
         panic "tensor layout has no block size: " + gguf_name
     }
     var list<f32> datos ← []
     var int off ← 0
     while off ≺ v.elements {
         const int n ← live_window(v.elements - off, block)
+        # One file read per window; every per-block read below is served
+        # from these bytes.
+        const int base ← v.absolute_start + (off / block) * block_bytes
+        const bytes window_bytes ← live_read_window(via, total, base, (n / block) * block_bytes, gguf_name)
         const list<f32> part ← live_slice(
             v,
             off,
             n,
-            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(via, total, initium, longitudo)
+            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_window_range(window_bytes, base, initium, longitudo)
         )
         var int pi ← 0
         while pi ≺ part.length() {
@@ -2315,6 +2356,18 @@ main args argv {
 # tests/admission-gate/; the provider-touching admission path is executed by
 # the admission-gate harness and proven by the in-tree BD-2 probe)
 # ---------------------------------------------------------------------------
+describe "live read window" tag "inferentia" {
+    test "a window never exceeds the read cap and stays block aligned" {
+        assert live_window(5, 1) ≡ 5
+        assert live_window(live_read_cap() + 7, 1) ≡ live_read_cap()
+        assert live_window(live_read_cap() * 3, 256) ≡ live_read_cap()
+        assert live_window(live_read_cap() * 3, 300) ≡ (live_read_cap() / 300) * 300
+    }
+    test "a block larger than the cap still gets a whole-block window" {
+        assert live_window(live_read_cap() * 4, live_read_cap() * 2) ≡ live_read_cap() * 2
+    }
+}
+
 describe "serve cli parse" tag "inferentia" {
     test "documented constants apply when no server flags are given" {
         const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
