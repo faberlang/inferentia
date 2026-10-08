@@ -496,10 +496,10 @@ fn json_parse_number(JsonCursor c) → JsonScalar {
         }
     }
     const int token_len ← cur.pos - start
-    if (not is_float) and (token_len > 18) {
+    if (not is_float) and (token_len ≻ 18) {
         return json_fail("malformed JSON: integer out of range", cur.pos)
     }
-    if is_float and (token_len > 24) {
+    if is_float and (token_len ≻ 24) {
         return json_fail("malformed JSON: number too long", cur.pos)
     }
     const string token ← body_text.slice(start, cur.pos)
@@ -669,7 +669,7 @@ fn json_parse_generate_body(string body) → GenerateRequest {
 
     # No trailing content allowed.
     const JsonCursor end ← json_skip_ws(cur)
-    if end.pos < body_text.length() {
+    if end.pos ≺ body_text.length() {
         return rejected_generate_request("malformed JSON: trailing content after object")
     }
     if not out.has_prompt {
@@ -804,8 +804,8 @@ fn tokens_text(tokenizator.Tokenizer tok, list<int> tokens) → DecodeResult {
 fn tokens_json(list<int> tokens) → string {
     var string out ← "["
     var int i ← 0
-    while i < tokens.length() {
-        if i > 0 { out ← out + "," }
+    while i ≺ tokens.length() {
+        if i ≻ 0 { out ← out + "," }
         const int t ← tokens.get(i) coalesce 0
         out ← out + (t ↦ string)
         i ← i + 1
@@ -844,7 +844,7 @@ fn generate_response_body(ServerState st, string text, list<int> tokens, list<in
 fn json_escape(string s) → string {
     var string out ← ""
     var int i ← 0
-    while i < s.length() {
+    while i ≺ s.length() {
         out ← out + json_escape_char(s.slice(i, i + 1))
         i ← i + 1
     }
@@ -865,7 +865,7 @@ fn json_escape_char(string c) → string {
         const int code ← (encoded.get(0) coalesce (0 ∷ u8)) ↦ int
         if code ≡ 8 { return "\\b" }
         if code ≡ 12 { return "\\f" }
-        if code < 32 {
+        if code ≺ 32 {
             return "\\u00" + json_hex_digit(code / 16) + json_hex_digit(code % 16)
         }
     }
@@ -956,7 +956,7 @@ fn wants_sse(server.Incoming incoming) → bool {
 fn send_generate_stream(server.Incoming incoming, ServerState st, string text, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
     const server.Stream stream ← server.open_sse(incoming)
     var int i ← 0
-    while i < tokens.length() {
+    while i ≺ tokens.length() {
         const int t ← tokens.get(i) coalesce 0
         const sse.Event ev ← sse.Event { name = "token", data = t ↦ string, id = "", retry = "" }
         server.send_event(stream, ev)
@@ -1005,7 +1005,7 @@ fn pinned_expect_q8() → int { return 17 }
 fn bytes_as_u8(bytes raw) → list<u8> {
     var list<u8> out ← []
     var int i ← 0
-    while i < raw.length() {
+    while i ≺ raw.length() {
         out.append(raw.get(i) coalesce (0 ∷ u8))
         i ← i + 1
     }
@@ -1038,7 +1038,7 @@ fn model_size_ceiling() → int {
 # the ceiling, null when the path may be read whole. Pure so the admission
 # rows can feed it sizes as inputs.
 fn check_admission_size(int observed) → string ∪ none {
-    if observed > model_size_ceiling() {
+    if observed ≻ model_size_ceiling() {
         return "model byte length " + (observed ↦ string) + " exceeds the admission ceiling " + (model_size_ceiling() ↦ string)
     }
     return null
@@ -1192,7 +1192,7 @@ fn live_read_range(string path, int start, int length) → bytes {
 }
 
 fn live_range(string path, int total, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo {
         throw variant BadSource { message = "range request exceeds the artifact" }
     }
     const bytes raw ← live_read_range(path, initium, longitudo)
@@ -1203,7 +1203,7 @@ fn live_range(string path, int total, int initium, int longitudo) → bytes ⇥ 
 }
 
 fn live_prefix_range(list<int> prefix, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ prefix.length() - longitudo {
         throw variant BadSource { message = "inspection attempted to read the tensor data region" }
     }
     const list<int> segment ← prefix.slice(initium, initium + longitudo)
@@ -1212,7 +1212,7 @@ fn live_prefix_range(list<int> prefix, int initium, int longitudo) → bytes ⇥
 }
 
 fn live_ends(string s, string tail) → bool {
-    if tail.length() > s.length() { return false }
+    if tail.length() ≻ s.length() { return false }
     return s.slice(s.length() - tail.length(), s.length()) ≡ tail
 }
 
@@ -1232,8 +1232,8 @@ fn live_slot(string nomen) → int {
 fn live_ids_text(list<int> ids) → string {
     var string out ← "["
     var int i ← 0
-    while i < ids.length() {
-        if i > 0 { out ← out + ", " }
+    while i ≺ ids.length() {
+        if i ≻ 0 { out ← out + ", " }
         out ← out + ((ids.get(i) coalesce 0) ↦ string)
         i ← i + 1
     }
@@ -1244,8 +1244,8 @@ fn live_ids_text(list<int> ids) → string {
 fn live_ids_flat(list<int> ids) → string {
     var string out ← ""
     var int i ← 0
-    while i < ids.length() {
-        if i > 0 { out ← out + " " }
+    while i ≺ ids.length() {
+        if i ≻ 0 { out ← out + " " }
         out ← out + ((ids.get(i) coalesce 0) ↦ string)
         i ← i + 1
     }
@@ -1266,7 +1266,7 @@ fn live_block_elements(tensor_view.TensorView v) → int {
 fn live_window(int remaining, int block) → int {
     if remaining ≤ pinned_slice_cap() { return remaining }
     const int aligned ← (pinned_slice_cap() / block) * block
-    if aligned < block { return block }
+    if aligned ≺ block { return block }
     return aligned
 }
 
@@ -1316,12 +1316,12 @@ fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string 
     }
     const tensor_view.TensorView v ← live_bind(m, p)
     const int block ← live_block_elements(v)
-    if block < 1 {
+    if block ≺ 1 {
         panic "tensor layout has no block size: " + gguf_name
     }
     var list<f32> datos ← []
     var int off ← 0
-    while off < v.elements {
+    while off ≺ v.elements {
         const int n ← live_window(v.elements - off, block)
         const list<f32> part ← live_slice(
             v,
@@ -1330,7 +1330,7 @@ fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string 
             (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(via, total, initium, longitudo)
         )
         var int pi ← 0
-        while pi < part.length() {
+        while pi ≺ part.length() {
             datos.append(part.get(pi) coalesce (0.0 ∷ f32))
             pi ← pi + 1
         }
@@ -1343,7 +1343,7 @@ fn live_gguf_name(string family, int stratum) → string {
     if family ≡ "model.embed_tokens" { return "token_embd.weight" }
     if family ≡ "model.norm" { return "output_norm.weight" }
     if family ≡ "lm_head" { return "token_embd.weight" }
-    if stratum < 0 or stratum ≥ 32 {
+    if stratum ≺ 0 or stratum ≥ 32 {
         panic "layer index outside the frozen llama layer range: " + (stratum ↦ string)
     }
     if family ≡ "model.layers.input_layernorm" { return ("blk." + (stratum ↦ string)) + ".attn_norm.weight" }
@@ -1367,9 +1367,9 @@ fn live_kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock {
     const int n ← f.get(1) coalesce 1
     var list<f32> out ← []
     var int i ← 0
-    while i < k {
+    while i ≺ k {
         var int j ← 0
-        while j < n {
+        while j ≺ n {
             out.append(t.data.get(j * k + i) coalesce (0.0 ∷ f32))
             j ← j + 1
         }
@@ -1402,11 +1402,11 @@ fn live_load_one(string via, int total, gguf_manifest.GgufManifest m, string fam
 fn live_lookup(string nomen, int stratum, tensor.NumericBlock embed, tensor.NumericBlock norm_s, list<list<tensor.NumericBlock>> strata) → tensor.NumericBlock ⇥ dense.DenseError {
     if nomen ≡ "model.embed_tokens" { return embed }
     if nomen ≡ "model.norm" { return norm_s }
-    if stratum < 0 or stratum ≥ strata.length() {
+    if stratum ≺ 0 or stratum ≥ strata.length() {
         throw variant MissingTensor { message = "layer out of range: " + (stratum ↦ string) }
     }
     const int slot ← live_slot(nomen)
-    if slot < 0 {
+    if slot ≺ 0 {
         throw variant MissingTensor { message = "unknown canonical tensor: " + nomen }
     }
     var list<tensor.NumericBlock> missing ← []
@@ -1421,7 +1421,7 @@ fn live_lookup(string nomen, int stratum, tensor.NumericBlock embed, tensor.Nume
 fn live_indices(int n) → list<int> {
     var list<int> out ← []
     var int i ← 0
-    while i < n {
+    while i ≺ n {
         out.append(i)
         i ← i + 1
     }
@@ -1432,8 +1432,8 @@ fn live_first_divergence(list<int> observed, list<int> golden) → string {
     var int i ← 0
     const int n ← observed.length()
     const int g ← golden.length()
-    const int lim ← if_int(n < g, n, g)
-    while i < lim {
+    const int lim ← if_int(n ≺ g, n, g)
+    while i ≺ lim {
         const int a ← observed.get(i) coalesce -1
         const int b ← golden.get(i) coalesce -2
         if a ≠ b {
@@ -1450,8 +1450,8 @@ fn live_first_divergence(list<int> observed, list<int> golden) → string {
 fn live_token_match_count(list<int> observed, list<int> golden) → int {
     var int matches ← 0
     var int i ← 0
-    const int lim ← if_int(observed.length() < golden.length(), observed.length(), golden.length())
-    while i < lim {
+    const int lim ← if_int(observed.length() ≺ golden.length(), observed.length(), golden.length())
+    while i ≺ lim {
         const int a ← observed.get(i) coalesce -1
         const int b ← golden.get(i) coalesce -2
         if a ≡ b { matches ← matches + 1 }
@@ -1462,7 +1462,7 @@ fn live_token_match_count(list<int> observed, list<int> golden) → int {
 
 fn live_requested(list<string> argv) → bool {
     var int i ← 1
-    while i < argv.length() {
+    while i ≺ argv.length() {
         const string arg ← argv.get(i) coalesce ""
         if arg ≡ "live" { return true }
         i ← i + 1
@@ -1566,10 +1566,10 @@ fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → R
     ]
     var list<list<tensor.NumericBlock>> strata ← []
     var int stratum ← 0
-    while stratum < 32 {
+    while stratum ≺ 32 {
         var list<tensor.NumericBlock> row ← []
         var int f ← 0
-        while f < families.length() {
+        while f ≺ families.length() {
             row.append(live_load_one(path, total, admitted, families.get(f) coalesce "", stratum))
             f ← f + 1
         }
@@ -1866,7 +1866,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
     var string subcommand ← ""
     var int i ← 1
 
-    while i < argv.length() {
+    while i ≺ argv.length() {
         const string arg ← argv.get(i) coalesce ""
         if arg ≡ "--help" or arg ≡ "-h" {
             print_help()
@@ -1891,7 +1891,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
             if i ≥ argv.length() then usage_error("missing value for --port")
             const string raw ← argv.get(i) coalesce ""
             const int port ← parse_int(raw)
-            if port < 0 or port > 65535 then usage_error("invalid port '" + raw + "' (expected 0..=65535)")
+            if port ≺ 0 or port ≻ 65535 then usage_error("invalid port '" + raw + "' (expected 0..=65535)")
             config.port ← port
         }
         elif arg ≡ "--max-tokens" {
@@ -1899,7 +1899,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
             if i ≥ argv.length() then usage_error("missing value for --max-tokens")
             const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
-            if value < 1 then usage_error("invalid max-tokens '" + raw + "' (expected >= 1)")
+            if value ≺ 1 then usage_error("invalid max-tokens '" + raw + "' (expected >= 1)")
             config.max_tokens ← value
         }
         elif arg ≡ "--max-prompt" {
@@ -1907,7 +1907,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
             if i ≥ argv.length() then usage_error("missing value for --max-prompt")
             const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
-            if value < 1 then usage_error("invalid max-prompt '" + raw + "' (expected >= 1)")
+            if value ≺ 1 then usage_error("invalid max-prompt '" + raw + "' (expected >= 1)")
             config.max_prompt ← value
         }
         elif arg ≡ "--context" {
@@ -1915,7 +1915,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
             if i ≥ argv.length() then usage_error("missing value for --context")
             const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
-            if value < 1 then usage_error("invalid context '" + raw + "' (expected >= 1)")
+            if value ≺ 1 then usage_error("invalid context '" + raw + "' (expected >= 1)")
             config.context ← value
         }
         elif arg ≡ "--seed" {
@@ -1923,7 +1923,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
             if i ≥ argv.length() then usage_error("missing value for --seed")
             const string raw ← argv.get(i) coalesce ""
             const int value ← parse_int(raw)
-            if value < 1 then usage_error("invalid seed '" + raw + "' (expected >= 1)")
+            if value ≺ 1 then usage_error("invalid seed '" + raw + "' (expected >= 1)")
             config.seed ← value
         }
         elif arg ≡ "--log-level" {
@@ -1951,7 +1951,7 @@ fn parse_cli(list<string> argv) → ServeConfig {
         elif arg ≡ "--ignore-eos" {
             config.ignore_eos ← true
         }
-        elif arg.starts_with("-") and arg.length() > 1 {
+        elif arg.starts_with("-") and arg.length() ≻ 1 {
             usage_error("unknown option '" + arg + "'")
         }
         else {
@@ -2071,7 +2071,7 @@ const int MAX_PROMPT_LENGTH = 65536
 # exceeds MAX_PROMPT_LENGTH, null when the prompt may flow to encode. Pure so
 # the gate rows can feed it prompts as inputs.
 fn check_prompt_length(string prompt) → string ∪ none {
-    if prompt.length() > MAX_PROMPT_LENGTH {
+    if prompt.length() ≻ MAX_PROMPT_LENGTH {
         return "prompt length " + (prompt.length() ↦ string) + " exceeds the bound " + (MAX_PROMPT_LENGTH ↦ string)
     }
     return null
@@ -2081,7 +2081,7 @@ fn check_prompt_length(string prompt) → string ∪ none {
 # and slice trims to the requested length.
 fn prompt_of_length(int n) → string {
     var string p ← "a"
-    while p.length() < n {
+    while p.length() ≺ n {
         p ← p + p
     }
     return p.slice(0, n)
@@ -2259,7 +2259,7 @@ fn serve(ServeConfig config) → void {
             }
             const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids(), resident, decoder.eog_stop())
             const int n ← warmup_tokens.length()
-            if n < 1 {
+            if n ≺ 1 {
                 state ← failed(state, "generation readiness: warm-up produced no tokens")
                 stderr_write("inferentia: generation readiness failed: warm-up produced no tokens\n")
             } else {

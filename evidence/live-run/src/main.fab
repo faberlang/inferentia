@@ -61,7 +61,7 @@ fn message(DecodeRunError e) → string {
 }
 
 fn _range(string via, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
-    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo {
         return gguf_manifest.SourceRead {
             successus = false,
             bytes = ||,
@@ -80,7 +80,7 @@ fn _range(string via, int total, int initium, int longitudo) → gguf_manifest.S
 }
 
 fn _prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
-    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ prefix.length() - longitudo {
         return gguf_manifest.SourceRead {
             successus = false,
             bytes = ||,

@@ -141,7 +141,7 @@ fn read_range(string path, int start, int length) → bytes {
 }
 
 fn source_range(string path, int total, int initium, int longitudo) → gguf_manifest.SourceRead {
-    if initium < 0 or longitudo < 0 or initium > total - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo {
         return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "range request exceeds the artifact" }
     }
     const bytes raw ← read_range(path, initium, longitudo)
@@ -152,7 +152,7 @@ fn source_range(string path, int total, int initium, int longitudo) → gguf_man
 }
 
 fn prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.SourceRead {
-    if initium < 0 or longitudo < 0 or initium > prefix.length() - longitudo {
+    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ prefix.length() - longitudo {
         return gguf_manifest.SourceRead { successus = false, bytes = ||, message = "inspection attempted to read the tensor data region" }
     }
     const list<int> segment ← prefix.slice(initium, initium + longitudo)
@@ -161,7 +161,7 @@ fn prefix_range(list<int> prefix, int initium, int longitudo) → gguf_manifest.
 }
 
 fn ends(string s, string tail) → bool {
-    if tail.length() > s.length() { return false }
+    if tail.length() ≻ s.length() { return false }
     return s.slice(s.length() - tail.length(), s.length()) ≡ tail
 }
 
@@ -192,7 +192,7 @@ fn block_elements(tensor_view.TensorView v) → int {
 fn window(int remaining, int block) → int {
     if remaining ≤ pinned_slice_cap() { return remaining }
     const int aligned ← (pinned_slice_cap() / block) * block
-    if aligned < block { return block }
+    if aligned ≺ block { return block }
     return aligned
 }
 
@@ -242,12 +242,12 @@ fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_
     }
     const tensor_view.TensorView v ← bind_view(m, p)
     const int block ← block_elements(v)
-    if block < 1 {
+    if block ≺ 1 {
         panic "tensor layout has no block size: " + gguf_name
     }
     var list<f32> datos ← []
     var int off ← 0
-    while off < v.elements {
+    while off ≺ v.elements {
         const int n ← window(v.elements - off, block)
         const list<f32> part ← slice_view(
             v,
@@ -256,7 +256,7 @@ fn materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_
             (int initium, int longitudo) → gguf_manifest.SourceRead ∴ source_range(via, total, initium, longitudo)
         )
         var int pi ← 0
-        while pi < part.length() {
+        while pi ≺ part.length() {
             datos.append(part.get(pi) coalesce (0.0 ∷ f32))
             pi ← pi + 1
         }
@@ -269,7 +269,7 @@ fn gguf_name(string family, int stratum) → string {
     if family ≡ "model.embed_tokens" { return "token_embd.weight" }
     if family ≡ "model.norm" { return "output_norm.weight" }
     if family ≡ "lm_head" { return "token_embd.weight" }
-    if stratum < 0 or stratum ≥ 32 {
+    if stratum ≺ 0 or stratum ≥ 32 {
         panic "layer index outside the frozen llama layer range: " + (stratum ↦ string)
     }
     if family ≡ "model.layers.input_layernorm" { return ("blk." + (stratum ↦ string)) + ".attn_norm.weight" }
@@ -293,9 +293,9 @@ fn kmajor_to_linear(tensor.Tensor t) → tensor.Tensor {
     const int n ← f.get(1) coalesce 1
     var list<f32> out ← []
     var int i ← 0
-    while i < k {
+    while i ≺ k {
         var int j ← 0
-        while j < n {
+        while j ≺ n {
             out.append(t.data.get(j * k + i) coalesce (0.0 ∷ f32))
             j ← j + 1
         }
@@ -328,11 +328,11 @@ fn load_one(string via, int total, gguf_manifest.GgufManifest m, string family, 
 fn lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, list<list<tensor.Tensor>> strata) → dense.Lookup {
     if nomen ≡ "model.embed_tokens" { return dense.Lookup { successus = true, tensorem = embed, message = "" } }
     if nomen ≡ "model.norm" { return dense.Lookup { successus = true, tensorem = norm_s, message = "" } }
-    if stratum < 0 or stratum ≥ strata.length() {
+    if stratum ≺ 0 or stratum ≥ strata.length() {
         return dense.Lookup { successus = false, tensorem = embed, message = "layer out of range: " + (stratum ↦ string) }
     }
     const int s ← slot(nomen)
-    if s < 0 {
+    if s ≺ 0 {
         return dense.Lookup { successus = false, tensorem = embed, message = "unknown canonical tensor: " + nomen }
     }
     var list<tensor.Tensor> missing ← []
@@ -347,7 +347,7 @@ fn lookup(string nomen, int stratum, tensor.Tensor embed, tensor.Tensor norm_s, 
 fn indices(int n) → list<int> {
     var list<int> out ← []
     var int i ← 0
-    while i < n {
+    while i ≺ n {
         out.append(i)
         i ← i + 1
     }
@@ -422,10 +422,10 @@ fn load_resident(string path) → ResidentModel {
     ]
     var list<list<tensor.Tensor>> strata ← []
     var int stratum ← 0
-    while stratum < 32 {
+    while stratum ≺ 32 {
         var list<tensor.Tensor> row ← []
         var int f ← 0
-        while f < families.length() {
+        while f ≺ families.length() {
             row.append(load_one(path, total, admitted, families.get(f) coalesce "", stratum))
             f ← f + 1
         }
@@ -557,7 +557,7 @@ fn expect_reject_wire(string wire, string needle) → void {
 fn sequences_equal(list<int> actual, list<int> expected) → bool {
     if actual.length() ≠ expected.length() { return false }
     var int i ← 0
-    while i < actual.length() {
+    while i ≺ actual.length() {
         const int a ← actual.get(i) coalesce -1
         const int b ← expected.get(i) coalesce -2
         if a ≠ b { return false }
@@ -569,9 +569,9 @@ fn sequences_equal(list<int> actual, list<int> expected) → bool {
 fn print_int_list(string label, list<int> ids) → void {
     stdout_write(label + ": [")
     var int i ← 0
-    while i < ids.length() {
+    while i ≺ ids.length() {
         const int t ← ids.get(i) coalesce 0
-        if i > 0 {
+        if i ≻ 0 {
             stdout_write(",")
         }
         stdout_write(t ↦ string)

@@ -51,7 +51,7 @@ fn exit_with(int code) → void {
 fn bytes_as_u8(bytes raw) → list<u8> {
     var list<u8> out ← []
     var int i ← 0
-    while i < raw.length() {
+    while i ≺ raw.length() {
         out.append(raw.get(i) coalesce (0 ∷ u8))
         i ← i + 1
     }
@@ -85,7 +85,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
 }
 
 main args argv {
-    if argv.length() < 2 {
+    if argv.length() ≺ 2 {
         stderr_write("usage: admission-gate <model-path>\n")
         exit_with(1)
     }
