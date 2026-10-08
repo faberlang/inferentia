@@ -39,7 +39,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GATE="$ROOT/tests/admission-gate"
 BIN="$GATE/target/debug/admission-gate"
 SERVER="$ROOT/target/debug/inferentia"
-MODEL="${1:-/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf}"
+MODEL="${1:-/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf}"
 PORT="${PORT:-18107}"
 
 # Compiler contract (see README "Current commands"): the package imports
@@ -105,7 +105,7 @@ note ""
 note "== positive control: pinned row -> exit 0 + pinned SHA-256 =="
 OUT="$("$BIN" "$MODEL" 2>&1)"
 STATUS=$?
-if [ "$STATUS" -eq 0 ] && printf '%s\n' "$OUT" | grep -qF "admitted: 2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"; then
+if [ "$STATUS" -eq 0 ] && printf '%s\n' "$OUT" | grep -qF "admitted: 07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0"; then
     ok "pinned row admitted (exit 0, verified whole-file SHA-256)"
 else
     bad "positive control expected exit 0 + pinned SHA-256, observed status $STATUS: $OUT"

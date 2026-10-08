@@ -3,12 +3,12 @@
 # =============================================================================
 #
 # This no-host harness mirrors the U3 `/model` endpoint contract. It drives
-# the admission contract (`solum:digestio` + `solum:hauri` →
+# the admission contract (`solum:digestio` + a header-prefix read →
 # `gradus:model/gguf` admit) and verifies the identity facts the
 # `/model` body carries:
 #
 #   1. ADMISSION: admit returns the pinned row's whole-file SHA-256
-#      (2fa3f013…), the one runtime fact in the /model body.
+#      (07735177…), the one runtime fact in the /model body.
 #   2. EXPECTED BODY: the D3 schema assembled from the admitted sha256 + the
 #      pinned documented constants (name, architecture, quantization,
 #      file_size_bytes, context_length, vocab_size, backend, max_output_tokens
@@ -28,24 +28,27 @@
 # Usage: model-gate <model-path>
 #
 # Exit: 0 on ALL PASS, 1 on any FAIL (a script can gate on the exit code).
-# Model identity: pinned SmolLM2-360M-Instruct-Q4_K_M.gguf (i1-discovery §2.1)
-#   size 270,590,880 bytes, sha256
-#   2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+# Model identity: pinned SmolLM2-360M-Instruct-f32.gguf (A1-ADMIT re-pin)
+#   size 1,449,071,040 bytes, sha256
+#   07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0
 
 import from "gradus:model/capsule" capsula
+import from "norma:console" console
+import from "norma:process" proc
+import from "norma:fs" fsys
 import from "gradus:model/gguf" gguf
 
 # --- I/O + exit ------------------------------------------------------------
 fn stdout_write(string text) → void {
-    return call 'consolum:dic' (text) ↦ void
+    return console.write_partial(text)
 }
 
 fn stderr_write(string text) → void {
-    return call 'consolum:mone' (text) ↦ void
+    return console.warn_line(text)
 }
 
 fn exit_with(int code) → void {
-    return call 'processus:exi' (code) ↦ void
+    proc.exit_process(code)
 }
 
 fn fail(string why) → void {
@@ -53,32 +56,28 @@ fn fail(string why) → void {
     exit_with(1)
 }
 
-fn bytes_as_u8(bytes raw) → list<u8> {
-    var list<u8> out ← []
-    var int i ← 0
-    while i ≺ raw.length() {
-        out.append(raw.get(i) coalesce (0 ∷ u8))
-        i ← i + 1
-    }
-    return out
+# The pinned F32 row's header prefix length (data region start).
+fn pinned_data_offset() → int {
+    return 1786560
 }
 
-# Path → host digest + bytes → gradus admit. Returns the carried digest.
+# Path → host digest + header prefix → gradus admit. Returns the carried digest.
 fn admit_model(string path) → string ⇥ gguf.GgufError {
     const string digest ← call 'solum:digestio' (path) ↦ string
-    const bytes raw ← call 'solum:hauri' (path) ↦ bytes
-    const list<u8> data ← bytes_as_u8(raw)
-    const capsula.Capsule cap ← gguf.admit(data, digest, 37, 290, 361821120, 65, 16, 176, 16, 17)
+    const int observed ← fsys.byte_length(path)
+    const bytes raw ← fsys.read_range(path, 0, pinned_data_offset())
+    const list<u8> prefix ← raw ↦ list<u8>
+    const capsula.Capsule cap ← gguf.admit(prefix, digest, observed, 0, 0, 30, 290, 361821120, 290, 0, 0, 0, 0)
     return cap.digest()
 }
 
 # --- Pinned facts (i1-discovery §2.1 identity table) -----------------------
 fn pinned_sha() → string {
-    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+    return "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0"
 }
 
 fn pinned_name() → string {
-    return "SmolLM2-360M-Instruct-Q4_K_M"
+    return "SmolLM2-360M-Instruct-F32"
 }
 
 fn pinned_architecture() → string {
@@ -86,11 +85,11 @@ fn pinned_architecture() → string {
 }
 
 fn pinned_quantization() → string {
-    return "q4_k_m"
+    return "f32"
 }
 
 fn pinned_file_size_bytes() → int {
-    return 270590880
+    return 1449071040
 }
 
 fn pinned_context_length() → int {
@@ -118,7 +117,7 @@ fn server_default_max_output_tokens() → int {
 # byte-identical and the exact-match check below proves the D3 assembly
 # reproduces that literal.
 fn expected_model_body() → string {
-    return "{\"name\":\"SmolLM2-360M-Instruct-Q4_K_M\",\"architecture\":\"llama\",\"quantization\":\"q4_k_m\",\"file_size_bytes\":270590880,\"sha256\":\"2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
+    return "{\"name\":\"SmolLM2-360M-Instruct-F32\",\"architecture\":\"llama\",\"quantization\":\"f32\",\"file_size_bytes\":1449071040,\"sha256\":\"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
 }
 
 # Assemble the D3 /model body from the admitted sha256 + pinned constants
@@ -152,7 +151,7 @@ main args argv {
         fail("admit raised: " + raise_error)
     }
     if sha ≡ pinned_sha() {
-        stdout_write("PASS admission: sha256 equals the pinned row (2fa3f013…)\n")
+        stdout_write("PASS admission: sha256 equals the pinned row (07735177…)\n")
     } else {
         fail("admission sha256 " + sha + " does not equal the pinned row")
     }

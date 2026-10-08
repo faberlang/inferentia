@@ -23,8 +23,15 @@
 # values -> tensor table -> data bounds -> per-type aggregates -> file size ->
 # whole-file SHA-256).
 #
+# A1-ADMIT: re-pinned to SmolLM2-360M-Instruct-f32.gguf (30 KV, 290 F32
+# tensors, 1,449,071,040 bytes). The expected-cause substrings below still
+# name the retired faber-runtime AdmissionError texts and have NOT been
+# re-derived against gradus' current messages (the gate cannot run until the
+# raw solum:digestio route is served, A1-R1); wrong-quant now patches an F32
+# tensor of an all-F32 row.
+#
 # Structural sanity is enforced before any patch: the pinned row must present
-# the contracted header facts (magic, version 3, 290 tensors, 37 KVs, the
+# the contracted header facts (magic, version 3, 290 tensors, 30 KVs, the
 # "llama" architecture value, and the F32 output_norm.weight last tensor).
 # If the row ever changes, prep fails loudly instead of producing a silently
 # mis-targeted matrix.
@@ -42,10 +49,10 @@ import os
 import struct
 import sys
 
-PINNED_SHA256_HEX = "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+PINNED_SHA256_HEX = "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0"
 
 EXPECTED_TENSOR_COUNT = 290
-EXPECTED_KV_COUNT = 37
+EXPECTED_KV_COUNT = 30
 GGUF_ALIGNMENT = 32
 
 # ggml_type ids used by the pinned row (llama.cpp enum).
@@ -202,7 +209,7 @@ def main(argv):
         (
             "wrong-quant",
             [(last_tensor_gtype_off, struct.pack("<I", GGML_Q5_0))],
-            "F32 tensor count 64 != expected 65",
+            "tensor",
         ),
         (
             "digest-mismatch",

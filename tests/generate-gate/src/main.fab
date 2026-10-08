@@ -14,6 +14,8 @@
 #      (fail closed, never silently ignored).
 #
 # Exit: 0 on ALL PASS, 1 on any FAIL.
+# NOTE (A1-ADMIT): this gate's goldens and offsets are Q4_K_M evidence and
+# stay pinned to that file; the inferentia product now pins the F32 file.
 # Model identity: pinned SmolLM2-360M-Instruct-Q4_K_M.gguf
 #   sha256 2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
 # Usage: generate-gate [model-path]
@@ -33,18 +35,20 @@ import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
 import from "norma:solum" solum
+import from "norma:console" console
+import from "norma:process" proc
 
 # --- I/O + exit ------------------------------------------------------------
 fn stdout_write(string text) → void {
-    return call 'consolum:dic' (text) ↦ void
+    return console.write_partial(text)
 }
 
 fn stderr_write(string text) → void {
-    return call 'consolum:mone' (text) ↦ void
+    return console.warn_line(text)
 }
 
 fn exit_with(int code) → void {
-    return call 'processus:exi' (code) ↦ void
+    proc.exit_process(code)
 }
 
 fn fail(string why) → void {

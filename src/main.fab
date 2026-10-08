@@ -46,6 +46,9 @@
 # cannot carry the D5 usage-error exit, so argv is parsed in this unit and
 # every usage error is detected before the listener binds.
 
+import from "norma:console" console
+import from "norma:fs" fsys
+import from "norma:process" proc
 import from "norma:http/headers" headers
 import from "norma:http/request" httpreq
 import from "norma:http/server" server
@@ -969,48 +972,41 @@ fn send_generate_stream(server.Incoming incoming, ServerState st, string text, l
 
 # Write text to stdout without a trailing newline.
 fn stdout_write(string text) → void {
-    return call 'consolum:dic' (text) ↦ void
+    return console.write_partial(text)
 }
 
 # Write a line to stderr.
 fn stderr_write(string text) → void {
-    return call 'consolum:mone' (text) ↦ void
+    return console.warn_line(text)
 }
 
 # D5 exit-code delivery: terminate the process with the given code (0 clean
 # shutdown, 2 admission/load failure at shutdown). The route is the language's
-# process-exit primitive (`processus:exi`); never returns on success — the
+# process-exit primitive (`norma:process` `exit_process`); never returns on success — the
 # generated wrapper panics if it returns.
 fn exit_with(int code) → void {
-    return call 'processus:exi' (code) ↦ void
+    proc.exit_process(code)
 }
 
 # ---------------------------------------------------------------------------
 # Gradus provider composition (ruling 2615e6a9)
 #
-# Admit: path → solum:digestio + solum:hauri → gguf.admit (pinned SmolLM2
+# Admit: path → solum:digestio + header-prefix read → gguf.admit (pinned SmolLM2
 # counts). Tokenize: G3. Generate: G2 generate_dense_with_stop over a resident dense engine.
 # ---------------------------------------------------------------------------
 
-# Pinned SmolLM2 row counts (gi0-model-contract / gguf.proba).
-fn pinned_expect_kv() → int { return 37 }
+# Pinned SmolLM2-360M-Instruct F32 row counts (GGUF v3: 30 KV, 290 tensors,
+# all F32, general.file_type 0, tokenizer padding id 0).
+fn pinned_expect_kv() → int { return 30 }
 fn pinned_expect_tensors() → int { return 290 }
 fn pinned_expect_elements() → int { return 361821120 }
-fn pinned_expect_f32() → int { return 65 }
-fn pinned_expect_q4k() → int { return 16 }
-fn pinned_expect_q5() → int { return 176 }
-fn pinned_expect_q6() → int { return 16 }
-fn pinned_expect_q8() → int { return 17 }
-
-fn bytes_as_u8(bytes raw) → list<u8> {
-    var list<u8> out ← []
-    var int i ← 0
-    while i ≺ raw.length() {
-        out.append(raw.get(i) coalesce (0 ∷ u8))
-        i ← i + 1
-    }
-    return out
-}
+fn pinned_expect_f32() → int { return 290 }
+fn pinned_expect_q4k() → int { return 0 }
+fn pinned_expect_q5() → int { return 0 }
+fn pinned_expect_q6() → int { return 0 }
+fn pinned_expect_q8() → int { return 0 }
+fn pinned_expect_file_type() → int { return 0 }
+fn pinned_expect_pad_id() → int { return 0 }
 
 # Host IO payloads are String. A ⇥ string wrapper lets them propagate
 # instead of aborting; admit_model's cape maps them into CapsulaMala.
@@ -1019,23 +1015,24 @@ fn host_digestio(string path) → string ⇥ string {
 }
 
 fn host_mensura(string path) → int ⇥ string {
-    return call 'solum:mensura' (path) ↦ int
+    return fsys.byte_length(path)
 }
 
-fn host_hauri(string path, int max) → bytes ⇥ string {
-    const list<value> args ← [path, max]
-    return call 'solum:hauri' (args) ↦ bytes
+# The header prefix [0, length): everything the manifest authority inspects.
+fn host_prefix(string path, int length) → list<u8> ⇥ string {
+    const bytes raw ← fsys.read_range(path, 0, length)
+    const list<u8> prefix ← raw ↦ list<u8>
+    return prefix
 }
 
-# Admission ceiling for the whole-file read: the pinned row's exact byte
-# length (S-F3 / G1-U8). Derived from the pinned size, never a new hardcoded
-# cap — the 64 MiB partem bound is a different route and stays untouched.
+# Admission ceiling for the artifact: the pinned row's exact byte length
+# (S-F3 / G1-U8). Derived from the pinned size, never a new hardcoded cap.
 fn model_size_ceiling() → int {
     return model_file_size_bytes()
 }
 
 # Size gate for admit_model: the refusal diagnostic when `observed` exceeds
-# the ceiling, null when the path may be read whole. Pure so the admission
+# the ceiling, null when the path may be admitted. Pure so the admission
 # rows can feed it sizes as inputs.
 fn check_admission_size(int observed) → string ∪ none {
     if observed ≻ model_size_ceiling() {
@@ -1044,21 +1041,25 @@ fn check_admission_size(int observed) → string ∪ none {
     return null
 }
 
-# Path → host stat + digest + bytes → gradus admit. Returns the carried digest.
-# The stat runs first and the ceiling gate refuses an over-ceiling path before
-# host_hauri, so it is never read whole (G1-U8); the ceiling is passed through
-# to the route, and the stat precedes the read mirroring the radix pinned
-# admission oracle's stat-before-read order.
+# Path → host stat + digest + header prefix → gradus admit. Returns the carried
+# digest. The stat runs first and the ceiling gate refuses an over-ceiling path
+# before anything is read (G1-U8); only the header prefix [0, data offset) is
+# read, never the tensor data, and the stat length is the artifact length the
+# digest covers.
 fn admit_model(string path) → string ⇥ gguf.GgufError {
     var string digest ← ""
-    var bytes raw ← ||
+    var list<u8> prefix ← []
+    var int observed ← 0
     var string ∪ none size_refusal ← null
     do {
-        const int size ← host_mensura(path)
-        size_refusal ← check_admission_size(size)
+        observed ← host_mensura(path)
+        size_refusal ← check_admission_size(observed)
+        if size_refusal is none and observed ≺ pinned_data_offset() {
+            size_refusal ← "model byte length " + (observed ↦ string) + " is shorter than the pinned header prefix " + (pinned_data_offset() ↦ string)
+        }
         if size_refusal is none {
             digest ← host_digestio(path)
-            raw ← host_hauri(path, model_size_ceiling())
+            prefix ← host_prefix(path, pinned_data_offset())
         }
     }
     catch err {
@@ -1067,8 +1068,7 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     if size_refusal not is none {
         throw variant BadCapsule { message = size_refusal coalesce "" }
     }
-    const list<u8> data ← bytes_as_u8(raw)
-    const capsule.Capsule cap ← gguf.admit(data, digest, pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
+    const capsule.Capsule cap ← gguf.admit(prefix, digest, observed, pinned_expect_file_type(), pinned_expect_pad_id(), pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
     return cap.digest()
 }
 
@@ -1153,28 +1153,25 @@ fn fresh_resident_caches(ResidentModel model) → list<kv.KVCache> {
 # generate_dense_with_stop with an explicit StopPolicy (default eog_stop).
 # live is the composed provider run: admit → inspect → G3 tokenizer
 # tables → dense weights → generate_dense_with_stop (eog_stop by default;
-# --ignore-eos selects ignore_eos and the 16-token golden compare).
+# --ignore-eos selects ignore_eos; no golden compare is recorded for it).
 # ---------------------------------------------------------------------------
 
 fn pinned_digest() → string {
-    return "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
+    return "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0"
 }
 
 fn pinned_data_offset() → int {
-    return 1787040
+    return 1786560
 }
 
 fn pinned_slice_cap() → int {
     return 16777216
 }
 
-# U5 / record.json generated_tokens[0..16] (i1-validation-u5). The
-# **ignore_eos** continuation — the EOG id is sample-suppressed only under
-# ignore_eos (gradus decoder.fab:140-144), so this golden compares only
-# under --ignore-eos.
-fn golden_tokens_16() → list<int> {
-    return [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
-}
+# NOTE: the former 16-token ignore_eos golden was Q4_K_M evidence (U5
+# record.json); it does not describe the F32 row and is retired. No F32
+# ignore_eos golden is recorded yet (A1-ORACLE supplies the F32 references),
+# so `--ignore-eos` runs print the ids without an oracle compare.
 
 # The frozen fixture's greedy eog_stop continuation (generate-gate header
 # fact: the EOG id terminates the run, so the run is [30, 2]).
@@ -1183,12 +1180,11 @@ fn frozen_eog_continuation() → list<int> {
 }
 
 fn live_file_size(string path) → int {
-    return call 'solum:mensura' (path) ↦ int
+    return fsys.byte_length(path)
 }
 
 fn live_read_range(string path, int start, int length) → bytes {
-    const list<value> args ← [path, start, length]
-    return call 'solum:partem' (args) ↦ bytes
+    return fsys.read_range(path, start, length)
 }
 
 fn live_range(string path, int total, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
@@ -1788,14 +1784,12 @@ fn live_run(ServeConfig serve_config) → void {
     stdout_write("text=" + text + "\n")
 
     # Oracle: only the frozen fixture has a golden. eog_stop compares the
-    # [30, 2] continuation; --ignore-eos compares the 16-token U5 golden.
+    # [30, 2] continuation; --ignore-eos has no recorded F32 golden.
     var list<int> golden ← []
     var bool oracle ← false
     if prompt_text ≡ frozen_prompt_text() {
-        oracle ← true
-        if serve_config.ignore_eos {
-            golden ← golden_tokens_16()
-        } else {
+        if not serve_config.ignore_eos {
+            oracle ← true
             golden ← frozen_eog_continuation()
         }
     }
@@ -2002,14 +1996,14 @@ fn health_body(ServerState st) → string {
 # The pinned-row identity facts (i1-discovery §2.1 identity table; D3 schema).
 # `sha256` is the one runtime fact — from the BD-2 admit route, held in
 # ServerState. Every other field is a documented constant for the pinned
-# SmolLM2-360M-Instruct-Q4_K_M row; `max_output_tokens` is the server default
+# SmolLM2-360M-Instruct-F32 row; `max_output_tokens` is the server default
 # (D2 precedence — the configured `--max-tokens` value, not a per-request
 # value). Field order is the D3 order: name, architecture, quantization,
 # file_size_bytes, sha256, context_length, vocab_size, max_output_tokens,
 # backend.
 # ---------------------------------------------------------------------------
 fn model_identity_name() → string {
-    return "SmolLM2-360M-Instruct-Q4_K_M"
+    return "SmolLM2-360M-Instruct-F32"
 }
 
 fn model_architecture() → string {
@@ -2017,11 +2011,11 @@ fn model_architecture() → string {
 }
 
 fn model_quantization() → string {
-    return "q4_k_m"
+    return "f32"
 }
 
 fn model_file_size_bytes() → int {
-    return 270590880
+    return 1449071040
 }
 
 fn model_vocab_size() → int {
@@ -2678,10 +2672,10 @@ describe "generate response" tag "inferentia" {
 }
 describe "model endpoint" tag "inferentia" {
     test "pinned identity constants match the discovery facts" {
-        assert model_identity_name() ≡ "SmolLM2-360M-Instruct-Q4_K_M"
+        assert model_identity_name() ≡ "SmolLM2-360M-Instruct-F32"
         assert model_architecture() ≡ "llama"
-        assert model_quantization() ≡ "q4_k_m"
-        assert model_file_size_bytes() ≡ 270590880
+        assert model_quantization() ≡ "f32"
+        assert model_file_size_bytes() ≡ 1449071040
         assert model_vocab_size() ≡ 49152
         assert model_backend() ≡ "cpu"
         assert model_context_limit() ≡ 8192
@@ -2690,8 +2684,8 @@ describe "model endpoint" tag "inferentia" {
         # Exact D3 wire format (field order, no whitespace) — the same literal
         # committed as tests/model-gate/expected-model-body.json, which the
         # live curl proof diffs against.
-        const ServerState st ← admitted(new_state("/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf"), "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
-        assert model_body(st, 32) ≡ "{\"name\":\"SmolLM2-360M-Instruct-Q4_K_M\",\"architecture\":\"llama\",\"quantization\":\"q4_k_m\",\"file_size_bytes\":270590880,\"sha256\":\"2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
+        const ServerState st ← admitted(new_state("/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf"), "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0")
+        assert model_body(st, 32) ≡ "{\"name\":\"SmolLM2-360M-Instruct-F32\",\"architecture\":\"llama\",\"quantization\":\"f32\",\"file_size_bytes\":1449071040,\"sha256\":\"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
     }
     test "model body reflects the configured max_output_tokens" {
         const ServerState st ← admitted(new_state("/m.gguf"), "2fa3f013")
@@ -2713,7 +2707,7 @@ describe "model endpoint" tag "inferentia" {
 describe "admission size ceiling" tag "inferentia" {
     test "pinned row size passes the ceiling gate" {
         # The gate is pure so the rows feed sizes as inputs: admission refuses
-        # an over-ceiling path before host_hauri runs (admit_model only reaches
+        # an over-ceiling path before any byte is read (admit_model only reaches
         # the read when the gate returns null), and the pinned size passes.
         assert check_admission_size(model_file_size_bytes()) is none
         assert model_size_ceiling() ≡ model_file_size_bytes()
