@@ -21,8 +21,11 @@
 # The loop is `port_generate` below; the pure parts it uses are above it and
 # are covered by the tests at the end of the pure section.
 #
-# The only per-token host read is the logits vector: the native argmax, or under
-# `trace` the full-vocabulary scan that also yields the top two ids and logits.
+# The per-token host read is, in the plain stop-policy path, only the 256 chunk
+# pairs of the device `argmax_chunks` kernel (P = 256 chunks of 192 logits; the
+# host scans 256 pairs, not 49,152 logits). Under ignore_eos it is the native
+# argmax of the masked logits, and under `trace` the full-vocabulary scan that
+# also yields the top two ids and logits.
 #
 # Greedy only. The finish reasons are `stop` (an EOG id was chosen; the EOG id
 # is part of the returned ids, as in the host path) and `length`.
@@ -31,6 +34,7 @@
 import from "norma:console" console
 
 import from "gradus:decode_token" dt
+import from "gradus:decode_step" ds
 
 import from "./port_weights" port
 
@@ -157,6 +161,26 @@ fn port_argmax(tensor<f32, [49152]> logits) → int {
     return reduce via argmax from logits at [i] coalesce 0
 }
 
+# The host half of the chunked argmax: the best (value, global index) pair of
+# each of the 256 chunks of 192 logits, scanned in ascending chunk order with a
+# strict `>`. Chunks are contiguous and ascending and the device kernel keeps the
+# first index inside a chunk, so the lowest global index wins ties, as in
+# `port_argmax` and `port_scan`. The indices are f32 (exact below 2^24).
+@ public
+fn port_chunk_pick(tensor<f32, [256]> vals, tensor<f32, [256]> idxs) → int {
+    var f32 top ← vals[[0]]
+    var int best ← idxs[[0]] ↦ int ⊥ 0
+    var int p ← 1
+    while p ≺ 256 {
+        if vals[[p]] ≻ top {
+            top ← vals[[p]]
+            best ← idxs[[p]] ↦ int ⊥ 0
+        }
+        p ← p + 1
+    }
+    return best
+}
+
 # ---------------------------------------------------------------------------
 # Helpers of the decode loop (the loop itself is `port_generate` below)
 # ---------------------------------------------------------------------------
@@ -243,6 +267,34 @@ describe "port generate argmax" tag "inferentia" {
     }
 }
 
+describe "port generate chunk pick" tag "inferentia" {
+    test "the largest chunk value wins and its global index is returned" {
+        var tensor<f32, [256]> v ← tf32[256] {}
+        var tensor<f32, [256]> x ← tf32[256] {}
+        v[[3]] ← 2.0 ∷ f32
+        x[[3]] ← 700.0 ∷ f32
+        v[[200]] ← 9.0 ∷ f32
+        x[[200]] ← 49151.0 ∷ f32
+        assert port_chunk_pick(v, x) ≡ 49151
+    }
+    test "equal chunk values keep the lowest chunk, hence the lowest index" {
+        var tensor<f32, [256]> v ← tf32[256] {}
+        var tensor<f32, [256]> x ← tf32[256] {}
+        v[[5]] ← 4.0 ∷ f32
+        x[[5]] ← 960.0 ∷ f32
+        v[[6]] ← 4.0 ∷ f32
+        x[[6]] ← 1152.0 ∷ f32
+        assert port_chunk_pick(v, x) ≡ 960
+    }
+    test "all chunks equal picks the first chunk" {
+        var tensor<f32, [256]> v ← tf32[256] {}
+        var tensor<f32, [256]> x ← tf32[256] {}
+        x[[0]] ← 0.0 ∷ f32
+        x[[1]] ← 192.0 ∷ f32
+        assert port_chunk_pick(v, x) ≡ 0
+    }
+}
+
 describe "port generate scan" tag "inferentia" {
     test "the scan picks the top two with the first index winning ties" {
         var tensor<f32, [49152]> t ← tf32[49152] {}
@@ -309,6 +361,11 @@ fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eo
     var tensor<f32, [15]> hdom ← tf32[15] {}
     var tensor<i32, [1]> ids ← tensor<i32, [1]> {}
     var tensor<f32, [49152]> logits ← tf32[49152] {}
+    # The chunked device argmax (plain stop-policy path): P = 256 chunks of 192.
+    const i32 pchunk ← port_i32(192)
+    var tensor<f32, [256]> cdom ← tf32[256] {}
+    var tensor<f32, [256]> cval ← tf32[256] {}
+    var tensor<f32, [256]> cidx ← tf32[256] {}
     var list<int> out ← []
     var string finish ← "length"
     var bool done ← false
@@ -356,6 +413,9 @@ fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eo
                 const PortTop top ← port_scan(logits, skip)
                 chosen ← top.id1
                 console.warn_line(port_trace_line(step, chosen, top.id1, top.val1, top.id2, top.val2))
+            } elif stop_on_eog {
+                ds.argmax_chunks(cdom, logits, mut cval, mut cidx, pchunk)
+                chosen ← port_chunk_pick(cval, cidx)
             } else {
                 port_mask(mut logits, skip)
                 chosen ← port_argmax(logits)
