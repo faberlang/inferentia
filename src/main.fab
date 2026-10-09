@@ -1118,6 +1118,20 @@ fn empty_manifest() → gguf_manifest.GgufManifest {
     }
 }
 
+# A manifest that carries only the admitted identity (digest + artifact length):
+# what the load-time identity re-check reads.
+fn identity_manifest(string sha, int length) → gguf_manifest.GgufManifest {
+    return gguf_manifest.GgufManifest {
+        identity = artifact.ContentIdentity { algorithm = "sha-256", digest = sha, length = length },
+        version = 0,
+        alignment = 0,
+        data_start = 0,
+        artifact_length = length,
+        metadata = [],
+        tensors = []
+    }
+}
+
 # The unready placeholder tokenizer: empty tables. `build_tables` rejects
 # an empty vocabulary, so the placeholder is the class literal; any encode
 # against it fails closed with a typed UnknownTrace cause (never read on
@@ -1761,12 +1775,34 @@ fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → port.
     )
 }
 
-# The port path's digest-bound entry: the same admit -> re-digest ->
-# check_materialized_digest sequence as load_resident_model (the file is
-# re-digested after admission and must equal the admitted sha and the
-# operator pin before any weight is read), then load_port_weights.
-fn load_port_model(string path, string sha, string expected_digest) → port.PortWeights ⇥ gguf.GgufError {
-    const gguf_manifest.GgufManifest admitted ← inspect_model(path, sha)
+# Load-time length guard for the port path (A1 one-manifest). It is an
+# ADDITIONAL cheap check on top of the load-time digest (verify_load_digest),
+# never a replacement for it: the manifest was inspected for the admitted
+# digest, and the file's current byte length equals the admitted length, checked
+# before and again after the weights are read. A same-size content swap is the
+# digest's job. Pure so the rows can feed sizes and digests as inputs.
+fn check_load_identity(string sha, gguf_manifest.GgufManifest admitted, int observed) → string ∪ none {
+    if admitted.identity.digest ≠ sha {
+        return "model changed between admission and materialization: admitted=" + sha + " manifest=" + admitted.identity.digest
+    }
+    if observed ≠ admitted.artifact_length {
+        return "model changed between admission and materialization: admitted length=" + (admitted.artifact_length ↦ string) + " observed length=" + (observed ↦ string)
+    }
+    return null
+}
+
+fn refuse_load_identity(string sha, gguf_manifest.GgufManifest admitted, string path) → void ⇥ gguf.GgufError {
+    const string ∪ none refusal ← check_load_identity(sha, admitted, live_file_size(path))
+    if refusal not is none {
+        throw variant BadCapsule { message = refusal coalesce "" }
+    }
+}
+
+# Materialization re-verify (G1-U9): the file is re-digested at load time,
+# after admission and before any weight is read, and must equal the admitted
+# sha (and --expected-digest when set), so a swap between admit and load -
+# including a same-size content swap - cannot serve swapped weights.
+fn verify_load_digest(string path, string sha, string expected_digest) → void ⇥ gguf.GgufError {
     var string materialized ← ""
     do {
         materialized ← host_digestio(path)
@@ -1778,6 +1814,22 @@ fn load_port_model(string path, string sha, string expected_digest) → port.Por
     if refusal not is none {
         throw variant BadCapsule { message = refusal coalesce "" }
     }
+}
+
+# The port path's digest-bound entry: the manifest is the one inspected from
+# the admitted header prefix (passed in, never re-parsed). Length guard, then
+# the load-time digest re-verify, then the weights, then the length guard
+# again.
+fn load_port_model(string path, string sha, string expected_digest, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf.GgufError {
+    refuse_load_identity(sha, admitted, path)
+    verify_load_digest(path, sha, expected_digest)
+    const port.PortWeights loaded ← load_port_weights_as_capsula(path, admitted)
+    refuse_load_identity(sha, admitted, path)
+    return loaded
+}
+
+# load_port_weights with its manifest-side refusals mapped into BadCapsule.
+fn load_port_weights_as_capsula(string path, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf.GgufError {
     do {
         return load_port_weights(path, admitted)
     }
@@ -1845,9 +1897,8 @@ fn generate_tokens(GenerateConfig cfg, list<int> ids, ResidentModel model, list<
 
 # The tokenizer + EOG set the metal backend needs without the NumericBlock
 # weights: an otherwise-empty ResidentModel (ready = false) built from the
-# admitted manifest.
-fn port_resident(gguf_manifest.GgufManifest admitted) → ResidentModel {
-    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
+# admitted manifest and the tokenizer built once from it.
+fn port_resident(gguf_manifest.GgufManifest admitted, tokenizator.Tokenizer tok) → ResidentModel {
     return ResidentModel {
         ready = false,
         engine = dense_gen.default_dense_engine(),
@@ -1870,7 +1921,7 @@ fn print_port_result(tokenizator.Tokenizer tok, pgen.PortResult res) → void {
 # The metal-backend one-shot: digest-bound bulk weight load, then the greedy
 # port decode loop. `--trace` prints one stderr trace line per generated step.
 fn live_run_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManifest admitted, tokenizator.Tokenizer tok, list<int> prompt_ids) → void {
-    const ResidentModel model ← port_resident(admitted)
+    const ResidentModel model ← port_resident(admitted, tok)
     const GenerateConfig cfg ← GenerateConfig {
         contextus = model_context_limit(),
         magna_promptus = effective_max_prompt(serve_config),
@@ -1884,15 +1935,15 @@ fn live_run_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManifes
     }
     const decoder.StopPolicy stop ← live_stop_policy(serve_config.ignore_eos)
     stderr_write("port: load-start\n")
-    const port.PortWeights weights ← live_load_port(serve_config, sha)
+    const port.PortWeights weights ← live_load_port(serve_config, sha, admitted)
     stderr_write("port: load-done\n")
     const pgen.PortResult res ← live_port_generate(cfg, prompt_ids, model, weights, stop, serve_config.trace)
     print_port_result(tok, res)
 }
 
-fn live_load_port(ServeConfig serve_config, string sha) → port.PortWeights {
+fn live_load_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManifest admitted) → port.PortWeights {
     do {
-        return load_port_model(serve_config.model, sha, serve_config.expected_digest)
+        return load_port_model(serve_config.model, sha, serve_config.expected_digest, admitted)
     }
     catch err {
         panic "port load failed: " + err.message
@@ -2419,8 +2470,8 @@ fn accept_loop_step(bool serving, string err) → bool {
 
 # Serve's single resident port load: the weights wrapped in a one-element list
 # (the cpu backend passes an empty list, so no placeholder weights exist).
-fn port_serve_load(ServeConfig config, string sha) → list<port.PortWeights> ⇥ gguf.GgufError {
-    const port.PortWeights weights ← load_port_model(config.model, sha, config.expected_digest)
+fn port_serve_load(ServeConfig config, string sha, gguf_manifest.GgufManifest admitted) → list<port.PortWeights> ⇥ gguf.GgufError {
+    const port.PortWeights weights ← load_port_model(config.model, sha, config.expected_digest, admitted)
     return [weights]
 }
 
@@ -2464,11 +2515,12 @@ fn serve(ServeConfig config) → void {
     var list<port.PortWeights> ports ← []
     if state.state ≡ "ready" and config.backend ≡ "metal" {
         # The metal backend loads the bulk port weights ONCE here (digest-bound,
-        # same admit -> re-digest sequence) and warms the launches with a one-token
+        # admit digest, re-digested at load, length guarded) and warms the launches with a one-token
         # generation; every /generate reuses them with a fresh cache pair.
         do {
-            ports ← port_serve_load(config, state.sha256)
-            resident ← port_resident(inspect_model(state.model_path, state.sha256))
+            const gguf_manifest.GgufManifest admitted_manifest ← inspect_model(state.model_path, state.sha256)
+            ports ← port_serve_load(config, state.sha256, admitted_manifest)
+            resident ← port_resident(admitted_manifest, live_build_tokenizer(admitted_manifest))
             stderr_write("inferentia: model loaded once (resident, metal) - generation ready\n")
         }
         catch err {
@@ -3140,5 +3192,76 @@ describe "serve admission digest" tag "inferentia" {
         const string ∪ none refusal ← check_materialized_digest("same-sha", "same-sha", "flag-sha")
         assert refusal not is none
         assert (refusal coalesce "").contains("flag-sha")
+    }
+    test "load length guard: matching digest and length pass" {
+        const gguf_manifest.GgufManifest m ← identity_manifest("admitted-sha", 1449071040)
+        assert check_load_identity("admitted-sha", m, 1449071040) is none
+    }
+    test "load length guard: a manifest inspected for another digest is refused" {
+        const gguf_manifest.GgufManifest m ← identity_manifest("other-sha", 1449071040)
+        const string ∪ none refusal ← check_load_identity("admitted-sha", m, 1449071040)
+        assert refusal not is none
+        assert (refusal coalesce "").contains("admitted-sha")
+        assert (refusal coalesce "").contains("other-sha")
+    }
+    test "load length guard: a file whose length changed since admission is refused" {
+        const gguf_manifest.GgufManifest m ← identity_manifest("admitted-sha", 1449071040)
+        const string ∪ none shorter ← check_load_identity("admitted-sha", m, 1449071039)
+        assert shorter not is none
+        assert (shorter coalesce "").contains("1449071039")
+        const string ∪ none longer ← check_load_identity("admitted-sha", m, 1449071041)
+        assert longer not is none
+    }
+    test "load digest: a same-length content swap is refused at load" {
+        # The length guard alone cannot see this; only the load-time digest does.
+        const string path ← "/tmp/inferentia-load-digest-swap.bin"
+        fsys.write_bytes(path, [1, 2, 3, 4] ↦ bytes)
+        var string admitted_sha ← ""
+        do {
+            admitted_sha ← host_digestio(path)
+        }
+        catch err {
+            panic "digest failed: " + err
+        }
+        var bool same_ok ← false
+        do {
+            verify_load_digest(path, admitted_sha, "")
+            same_ok ← true
+        }
+        catch err {
+            same_ok ← false
+        }
+        assert same_ok
+        fsys.write_bytes(path, [1, 2, 3, 5] ↦ bytes)
+        assert fsys.byte_length(path) ≡ 4
+        var string cause ← ""
+        do {
+            verify_load_digest(path, admitted_sha, "")
+        }
+        catch err {
+            cause ← err.message
+        }
+        fsys.delete(path)
+        assert cause.contains("model changed between admission and materialization")
+    }
+    test "load digest: the operator pin binds the load-time digest" {
+        const string path ← "/tmp/inferentia-load-digest-pin.bin"
+        fsys.write_bytes(path, [9, 9, 9, 9] ↦ bytes)
+        var string sha ← ""
+        do {
+            sha ← host_digestio(path)
+        }
+        catch err {
+            panic "digest failed: " + err
+        }
+        var string cause ← ""
+        do {
+            verify_load_digest(path, sha, "flag-sha")
+        }
+        catch err {
+            cause ← err.message
+        }
+        fsys.delete(path)
+        assert cause.contains("flag-sha")
     }
 }
