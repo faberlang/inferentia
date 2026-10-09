@@ -1,0 +1,338 @@
+# =============================================================================
+# Port generation — the A1 greedy decode loop on the gradus decode-token launches
+# =============================================================================
+#
+# Given the bulk-loaded `port.PortWeights` (port_weights.fab), the prompt token
+# ids, a new-token ceiling and the stop policy, this module runs
+#
+#   prefill   each prompt token, one at a time, through embed_step + 32 x
+#             layer_step; head_step only after the LAST prompt token
+#   decode    head_step -> host scan of the logits -> the chosen id is appended
+#             and fed back, until an EOG id (stop) or the ceiling (length)
+#
+# The structure is the proven `drive` of radix/acceptance/a1-token-step: per
+# layer weight tensors passed as plain arguments, the K/V caches held as
+# ping-pong pairs `tensor<f32, [C, 320]>` (a tensor cannot be both read and
+# `mut`; the roles swap every token), a run-time cache extent
+# `const size C ← c`, `pos` an i32, and the caches only ever passed to launches
+# (never indexed, flattened or copied on the host). The caches are allocated
+# once per call, so a request owns a fresh pair per layer.
+#
+# The loop is `port_generate` below; the pure parts it uses are above it and
+# are covered by the tests at the end of the pure section.
+#
+# The only per-token host read is the logits vector (a full-vocabulary scan
+# that also yields the top two ids and logits for the trace line).
+#
+# Greedy only. The finish reasons are `stop` (an EOG id was chosen; the EOG id
+# is part of the returned ids, as in the host path) and `length`.
+# =============================================================================
+
+import from "norma:console" console
+
+import from "gradus:decode_token" dt
+
+import from "./port_weights" port
+
+@ public
+class PortResult {
+    var list<int> ids
+    var string finish
+}
+
+@ public
+class PortTop {
+    var int id1
+    var f32 val1
+    var int id2
+    var f32 val2
+}
+
+# ---------------------------------------------------------------------------
+# Pure parts
+# ---------------------------------------------------------------------------
+
+# K/V cache capacity for one request: the context limit, or the prompt plus
+# the new-token ceiling when that is smaller. At least 1.
+@ public
+fn port_capacity(int context, int prompt_len, int max_new) → int {
+    const int want ← prompt_len + max_new
+    var int cap ← want
+    if context ≺ want {
+        cap ← context
+    }
+    if cap ≺ 1 {
+        return 1
+    }
+    return cap
+}
+
+# The finish reason of a run: `stop` when it ended on an EOG id, else `length`.
+@ public
+fn port_finish(bool hit_eog) → string {
+    if hit_eog {
+        return "stop"
+    }
+    return "length"
+}
+
+# Whether the loop ends after choosing a token: an EOG id under the stop
+# policy, the new-token ceiling, or no cache row left to feed the token into.
+@ public
+fn port_ends(bool stop_on_eog, bool is_eog, int generated, int max_new, int next_pos, int capacity) → bool {
+    if stop_on_eog and is_eog {
+        return true
+    }
+    if generated ≥ max_new {
+        return true
+    }
+    return next_pos ≥ capacity
+}
+
+# The oracle trace line for one generated step.
+@ public
+fn port_trace_line(int step, int id, int id1, f32 val1, int id2, f32 val2) → string {
+    return "trace step=" + (step ↦ string) + " id=" + (id ↦ string) + " top1=" + (id1 ↦ string) + ":" + (val1 ↦ string) + " top2=" + (id2 ↦ string) + ":" + (val2 ↦ string)
+}
+
+# int -> i32 outside main is failable; the values here are always in range.
+@ public
+fn port_i32(int x) → i32 {
+    return x ↦ i32 ⊥ (0 ∷ i32)
+}
+
+fn port_skipped(list<int> skip, int id) → bool {
+    return id ∈ skip
+}
+
+# Full-vocabulary scan: the largest and second largest logit (first index
+# wins ties), skipping the ids in `skip` (the EOG ids under ignore_eos).
+@ public
+fn port_scan(tensor<f32, [49152]> logits, list<int> skip) → PortTop {
+    var int id1 ← -1
+    var f32 val1 ← 0.0 ∷ f32
+    var int id2 ← -1
+    var f32 val2 ← 0.0 ∷ f32
+    const bool masked ← skip.length() ≻ 0
+    var int i ← 0
+    while i ≺ 49152 {
+        if masked and port_skipped(skip, i) {
+            i ← i + 1
+        } else {
+            const f32 x ← logits[[i]]
+            if id1 ≺ 0 or x ≻ val1 {
+                id2 ← id1
+                val2 ← val1
+                id1 ← i
+                val1 ← x
+            } elif id2 ≺ 0 or x ≻ val2 {
+                id2 ← i
+                val2 ← x
+            }
+            i ← i + 1
+        }
+    }
+    return PortTop { id1 = id1, val1 = val1, id2 = id2, val2 = val2 }
+}
+
+# ---------------------------------------------------------------------------
+# Helpers of the decode loop (the loop itself is `port_generate` below)
+# ---------------------------------------------------------------------------
+
+@ public
+fn port_progress(string text) → void {
+    console.warn_line("port: " + text)
+}
+
+# The masked set for the choice: empty under the stop policy (nothing is
+# skipped), the EOG ids under ignore_eos.
+@ public
+fn if_skip(bool stop_on_eog, list<int> eog_ids) → list<int> {
+    if stop_on_eog {
+        return []
+    }
+    return eog_ids
+}
+
+# ---------------------------------------------------------------------------
+# Tests (pure parts)
+# ---------------------------------------------------------------------------
+
+describe "port generate capacity" tag "inferentia" {
+    test "capacity is the prompt plus the ceiling when that fits the context" {
+        assert port_capacity(8192, 25, 64) ≡ 89
+        assert port_capacity(8192, 9, 32) ≡ 41
+    }
+    test "capacity is clamped to the context limit" {
+        assert port_capacity(50, 25, 64) ≡ 50
+    }
+    test "capacity is at least one row" {
+        assert port_capacity(0, 0, 0) ≡ 1
+    }
+}
+
+describe "port generate stop policy" tag "inferentia" {
+    test "finish reasons are stop and length" {
+        assert port_finish(true) ≡ "stop"
+        assert port_finish(false) ≡ "length"
+    }
+    test "an EOG id ends the run under the stop policy" {
+        assert port_ends(true, true, 2, 32, 11, 41)
+    }
+    test "an EOG id does not end the run under ignore_eos" {
+        assert not port_ends(false, true, 2, 32, 11, 41)
+    }
+    test "the ceiling ends the run" {
+        assert port_ends(true, false, 32, 32, 41, 100)
+    }
+    test "a full cache ends the run" {
+        assert port_ends(true, false, 3, 32, 41, 41)
+    }
+    test "an ordinary token continues" {
+        assert not port_ends(true, false, 3, 32, 12, 41)
+    }
+    test "the masked set is empty under the stop policy" {
+        assert if_skip(true, [2, 0]).length() ≡ 0
+        assert if_skip(false, [2, 0]).length() ≡ 2
+    }
+}
+
+describe "port generate trace line" tag "inferentia" {
+    test "the line carries the step, the chosen id and the top two logits" {
+        assert port_trace_line(0, 30, 30, 12.5 ∷ f32, 1270, 9.25 ∷ f32) ≡ "trace step=0 id=30 top1=30:12.5 top2=1270:9.25"
+    }
+}
+
+describe "port generate scan" tag "inferentia" {
+    test "the scan picks the top two with the first index winning ties" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[7]] ← 3.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        t[[40000]] ← 1.0 ∷ f32
+        const PortTop top ← port_scan(t, [])
+        assert top.id1 ≡ 7
+        assert top.id2 ≡ 9
+    }
+    test "skipped ids never win" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[7]] ← 5.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        t[[11]] ← 2.0 ∷ f32
+        const PortTop top ← port_scan(t, [7])
+        assert top.id1 ≡ 9
+        assert top.id2 ≡ 11
+    }
+}
+
+# Greedy generation. `prompt` must hold at least one id and fewer than
+# `context`; `max_new` >= 1; the caller validates both (main.fab). `eog_ids` is
+# the admitted tokenizer's EOG set; with `stop_on_eog` false the EOG ids are
+# masked out of the choice (the ignore_eos policy).
+@ public
+fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace) → PortResult {
+    const int np ← prompt.length()
+    const int c ← port_capacity(context, np, max_new)
+    const size C ← c
+    const i32 pd ← port_i32(960)
+    const i32 pqd ← port_i32(960)
+    const i32 pf ← port_i32(2560)
+    const i32 pdh ← port_i32(64)
+    const i32 pspan ← port_i32(32)
+    const i32 pgroup ← port_i32(3)
+    # The GGUF q/k weights are stored for llama.cpp's NORM rope (consecutive pairs
+    # (2p, 2p + 1)): rope convention 1 (gradus `rope_pairs`), weights used as stored.
+    const i32 prope ← port_i32(1)
+    const i32 pc ← port_i32(c)
+    const f32 eps ← 0.00001 ∷ f32
+    const f32 lntheta ← 11.512925 ∷ f32
+    const f32 attscale ← 0.125 ∷ f32
+
+    var list<tensor<f32, [C, 320]>> ka ← empty
+    var list<tensor<f32, [C, 320]>> kb ← empty
+    var list<tensor<f32, [C, 320]>> va ← empty
+    var list<tensor<f32, [C, 320]>> vb ← empty
+    var int l ← 0
+    while l ≺ port.PORT_LAYERS {
+        var tensor<f32, [C, 320]> c1 ← tf32[C, 320] {}
+        var tensor<f32, [C, 320]> c2 ← tf32[C, 320] {}
+        var tensor<f32, [C, 320]> c3 ← tf32[C, 320] {}
+        var tensor<f32, [C, 320]> c4 ← tf32[C, 320] {}
+        ka.append(c1)
+        kb.append(c2)
+        va.append(c3)
+        vb.append(c4)
+        l ← l + 1
+    }
+
+    const tensor<f32, [49152, 960]> emb ← w.embed
+    const tensor<f32, [960]> onorm ← w.out_norm
+    var tensor<f32, [15]> hdom ← tf32[15] {}
+    var tensor<i32, [1]> ids ← tensor<i32, [1]> {}
+    var tensor<f32, [49152]> logits ← tf32[49152] {}
+    var list<int> out ← []
+    var string finish ← "length"
+    var bool done ← false
+    var int t ← 0
+    var int cur ← prompt.get(0) coalesce 0
+    var i32 pos ← 0
+    const list<int> skip ← if_skip(stop_on_eog, eog_ids)
+    port_progress("prefill-start prompt=" + (np ↦ string) + " capacity=" + (c ↦ string))
+    while not done {
+        ids[0] ← port_i32(cur)
+        var tensor<f32, [960]> hcur ← tf32[960] {}
+        dt.embed_step(emb, ids, mut hcur)
+        var int ll ← 0
+        while ll ≺ port.PORT_LAYERS {
+            const port.PortLayer pl ← w.layers[ll]
+            const tensor<f32, [960]> lan ← pl.attn_norm
+            const tensor<f32, [960, 960]> lq ← pl.wq
+            const tensor<f32, [320, 960]> lk ← pl.wk
+            const tensor<f32, [320, 960]> lv ← pl.wv
+            const tensor<f32, [960, 960]> lo ← pl.wo
+            const tensor<f32, [960]> lfn ← pl.ffn_norm
+            const tensor<f32, [2560, 960]> lg ← pl.wg
+            const tensor<f32, [2560, 960]> lu ← pl.wu
+            const tensor<f32, [960, 2560]> ld ← pl.wd
+            var tensor<f32, [960]> hn ← tf32[960] {}
+            var tensor<f32, [C, 320]> kin ← ka[ll]
+            var tensor<f32, [C, 320]> kout ← kb[ll]
+            var tensor<f32, [C, 320]> vin ← va[ll]
+            var tensor<f32, [C, 320]> vout ← vb[ll]
+            if t % 2 ≡ 1 {
+                kin ← kb[ll]
+                kout ← ka[ll]
+                vin ← vb[ll]
+                vout ← va[ll]
+            }
+            dt.layer_step(hdom, hcur, mut hn, lan, lq, lk, lv, lo, lfn, lg, lu, ld, kin, mut kout, vin, mut vout, pos, pd, pqd, pf, pc, pdh, pspan, pgroup, eps, lntheta, attscale, prope)
+            hcur ← hn
+            ll ← ll + 1
+        }
+        if t ≥ np - 1 {
+            dt.head_step(hcur, onorm, emb, mut logits, pd, eps)
+            const PortTop top ← port_scan(logits, skip)
+            const int chosen ← top.id1
+            const int step ← out.length()
+            out.append(chosen)
+            if trace {
+                console.warn_line(port_trace_line(step, chosen, top.id1, top.val1, top.id2, top.val2))
+            }
+            if step ≡ 0 {
+                port_progress("decode-start")
+            }
+            const bool hit ← stop_on_eog and (chosen ∈ eog_ids)
+            if port_ends(stop_on_eog, chosen ∈ eog_ids, out.length(), max_new, t + 1, c) {
+                done ← true
+                finish ← port_finish(hit)
+            } else {
+                cur ← chosen
+            }
+        } else {
+            cur ← prompt.get(t + 1) coalesce 0
+        }
+        t ← t + 1
+        pos ← pos + 1
+    }
+    port_progress("decode-done tokens=" + (out.length() ↦ string))
+    return PortResult { ids = out, finish = finish }
+}

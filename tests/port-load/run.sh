@@ -25,7 +25,7 @@ mkdir -p "$SCRATCH/pkg/src"
 cp "$PKG/faber.toml" "$PKG/faber.lock" "$SCRATCH/pkg/"
 # faber.lock names the library by a path relative to the package root
 ln -sfn "$FABER_LIBRARY_HOME/gradus" "$SCRATCH/gradus"
-cp "$PKG/src/port_weights.fab" "$SCRATCH/pkg/src/"
+cp "$PKG/src/port_weights.fab" "$PKG/src/port_generate.fab" "$SCRATCH/pkg/src/"
 python3.13 - "$PKG/src/main.fab" "$HERE/driver.fab.part" "$SCRATCH/pkg/src/main.fab" <<'PY'
 import re, sys
 main, part, out = sys.argv[1:4]

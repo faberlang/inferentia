@@ -68,7 +68,6 @@ import from "gradus:attention/rope" rope
 import from "gradus:cache/kv" kv
 import from "gradus:cache/structure" structure
 import from "gradus:decode" decode
-import from "gradus:decode_token" dt
 import from "gradus:generation/config" config
 import from "gradus:generation/decoder" decoder
 import from "gradus:generation/dense" dense_gen
@@ -82,680 +81,8 @@ import from "gradus:model/tensor_view" tensor_view
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
 
-
-# NOTE: this section and the next were src/port_weights.fab and
-# src/port_generate.fab. They live in the entry module because ANY local module
-# import makes `faber run --device metal` drop the library kernels
-# (E_DEVICE_NONE_ADMITTED; reproducer in the A1-PORT-3 receipt).
-
-# =============================================================================
-# Port weights — the A1 weight load (U-G)
-# =============================================================================
-#
-# Each F32 tensor of the SmolLM2-360M GGUF is read ONCE (one range read at the
-# manifest's absolute offset) and reinterpreted in bulk,
-#
-#     raw ↦ tensor<f32, [N, K]> via Le
-#
-# with LITERAL shapes. GGUF stores a matrix with `ne` = [in, out] (ne0 is the
-# innermost, fastest axis); the row-major shape the A1 token step wants
-# (`gradus:decode_token` `layer_step` / `head_step` / `embed_step`) is the
-# REVERSED `ne` = [out, in]. The byte order of the file is already that
-# row-major order, so no transpose pass exists on this path, and the tied
-# embedding [V, D] serves embed_step and head_step alike.
-#
-# The shape table below is the validation authority: a tensor whose manifest
-# dims (reversed) or element type differ from it is refused by a named
-# GgufManifestError (UnknownLayout for the type, BadBounds for dims/length);
-# nothing is silently reshaped. A bad byte length inside the conversion is a
-# recoverable error and is mapped to BadBounds.
-#
-# The old NumericBlock host loader in main.fab is a separate path and is not
-# touched here.
-# =============================================================================
-
-@ public
-const int PORT_LAYERS = 32
-
-# ggml type code of F32 in the GGUF tensor table.
-const int GGML_TYPE_F32 = 0
-
-@ public
-class PortLayer {
-    var tensor<f32, [960]> attn_norm
-    var tensor<f32, [960, 960]> wq
-    var tensor<f32, [320, 960]> wk
-    var tensor<f32, [320, 960]> wv
-    var tensor<f32, [960, 960]> wo
-    var tensor<f32, [960]> ffn_norm
-    var tensor<f32, [2560, 960]> wg
-    var tensor<f32, [2560, 960]> wu
-    var tensor<f32, [960, 2560]> wd
-}
-
-@ public
-class PortWeights {
-    var tensor<f32, [49152, 960]> embed
-    var tensor<f32, [960]> out_norm
-    var list<PortLayer> layers
-}
-
-# ---------------------------------------------------------------------------
-# Tables (pure)
-# ---------------------------------------------------------------------------
-
-# The per-layer tensor suffixes, in load order.
-@ public
-fn port_layer_suffixes() → list<string> {
-    return [
-        "attn_norm.weight",
-        "attn_q.weight",
-        "attn_k.weight",
-        "attn_v.weight",
-        "attn_output.weight",
-        "ffn_norm.weight",
-        "ffn_gate.weight",
-        "ffn_up.weight",
-        "ffn_down.weight"
-    ]
-}
-
-# GGUF tensor name: a per-layer suffix under "blk.<layer>.", or the bare
-# top-level name when layer < 0.
-@ public
-fn port_tensor_name(int layer, string suffix) → string {
-    if layer ≺ 0 {
-        return suffix
-    }
-    return ("blk." + (layer ↦ string)) + "." + suffix
-}
-
-# Expected ROW-MAJOR shape (the reversed GGUF `ne`) per suffix; [] for an
-# unknown suffix.
-@ public
-fn port_shape(string suffix) → list<int> {
-    if suffix ≡ "token_embd.weight" { return [49152, 960] }
-    if suffix ≡ "output_norm.weight" { return [960] }
-    if suffix ≡ "attn_norm.weight" { return [960] }
-    if suffix ≡ "ffn_norm.weight" { return [960] }
-    if suffix ≡ "attn_q.weight" { return [960, 960] }
-    if suffix ≡ "attn_k.weight" { return [320, 960] }
-    if suffix ≡ "attn_v.weight" { return [320, 960] }
-    if suffix ≡ "attn_output.weight" { return [960, 960] }
-    if suffix ≡ "ffn_gate.weight" { return [2560, 960] }
-    if suffix ≡ "ffn_up.weight" { return [2560, 960] }
-    if suffix ≡ "ffn_down.weight" { return [960, 2560] }
-    return []
-}
-
-@ public
-fn port_elements(list<int> shape) → int {
-    var int n ← 1
-    var int i ← 0
-    while i ≺ shape.length() {
-        n ← n * (shape.get(i) coalesce 0)
-        i ← i + 1
-    }
-    return n
-}
-
-@ public
-fn port_same(list<int> a, list<int> b) → bool {
-    if a.length() ≠ b.length() { return false }
-    var int i ← 0
-    while i ≺ a.length() {
-        if (a.get(i) coalesce -1) ≠ (b.get(i) coalesce -2) { return false }
-        i ← i + 1
-    }
-    return true
-}
-
-# Total tensors the port load reads: embed + output norm + 9 per layer.
-@ public
-fn port_tensor_count() → int {
-    return 2 + PORT_LAYERS * port_layer_suffixes().length()
-}
-
-# ---------------------------------------------------------------------------
-# Validation (pure over primitives, so synthetic manifests are plain lists)
-# ---------------------------------------------------------------------------
-
-# `ne` is the manifest shape (ne0 first); `rowmajor` the expected row-major
-# shape. They must be the same dims in reverse order, and the type must be F32.
-@ public
-fn port_check_dims(string name, list<int> ne, int dtype, list<int> rowmajor) → void ⇥ gguf_manifest.GgufManifestError {
-    if dtype ≠ GGML_TYPE_F32 {
-        throw variant gguf_manifest.GgufManifestError.UnknownLayout { message = ("tensor " + name) + " is not F32 (ggml type " + (dtype ↦ string) + ")" }
-    }
-    if rowmajor.length() ≡ 0 {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + " has no expected shape" }
-    }
-    if ne.length() ≠ rowmajor.length() {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + " rank " + (ne.length() ↦ string) + " differs from the expected rank " + (rowmajor.length() ↦ string) }
-    }
-    var int i ← 0
-    while i ≺ ne.length() {
-        const int observed ← ne.get(i) coalesce -1
-        const int expected ← rowmajor.get(ne.length() - 1 - i) coalesce -2
-        if observed ≠ expected {
-            throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + " ne[" + (i ↦ string) + "]=" + (observed ↦ string) + " differs from the expected " + (expected ↦ string) }
-        }
-        i ← i + 1
-    }
-}
-
-# The stored byte range of one tensor after the shape/type checks:
-# (absolute_start, byte_length); byte_length must be 4 * elements exactly.
-@ public
-fn port_locate(gguf_manifest.GgufManifest m, string name, list<int> rowmajor) → tuple<int, int> ⇥ gguf_manifest.GgufManifestError {
-    const gguf_manifest.GgufTensorDescriptor d ← gguf_manifest.find_tensor(m, name)
-    port_check_dims(name, d.shape, d.dtype_ggml, rowmajor)
-    const tuple<int, int> limit ← gguf_manifest.payload_limit(m, name)
-    const int want ← port_elements(rowmajor) * 4
-    if limit[1] ≠ want {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + " stored length " + (limit[1] ↦ string) + " differs from " + (want ↦ string) }
-    }
-    return limit
-}
-
-# ONE range read per tensor through the caller's bounds-checked source.
-fn port_read((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, string name, list<int> rowmajor) → bytes ⇥ gguf_manifest.GgufManifestError {
-    const tuple<int, int> limit ← port_locate(m, name, rowmajor)
-    const bytes raw ← source(limit[0], limit[1])
-    if raw.length() ≠ limit[1] {
-        throw variant gguf_manifest.GgufManifestError.BadSource { message = ("tensor " + name) + " short read" }
-    }
-    return raw
-}
-
-fn port_note(string name) → void {
-    console.warn_line("port: loaded " + name)
-}
-
-# ---------------------------------------------------------------------------
-# Typed conversions: one function per literal shape. The conversion checks
-# the byte length itself; a mismatch is a recoverable error mapped to BadBounds.
-# ---------------------------------------------------------------------------
-
-fn port_conv_v960(bytes raw, string name) → tensor<f32, [960]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [960]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-fn port_conv_m960x960(bytes raw, string name) → tensor<f32, [960, 960]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [960, 960]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-fn port_conv_m320x960(bytes raw, string name) → tensor<f32, [320, 960]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [320, 960]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-fn port_conv_m2560x960(bytes raw, string name) → tensor<f32, [2560, 960]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [2560, 960]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-fn port_conv_m960x2560(bytes raw, string name) → tensor<f32, [960, 2560]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [960, 2560]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-fn port_conv_m49152x960(bytes raw, string name) → tensor<f32, [49152, 960]> ⇥ gguf_manifest.GgufManifestError {
-    do {
-        return raw ↦ tensor<f32, [49152, 960]> via Le
-    }
-    catch err {
-        throw variant gguf_manifest.GgufManifestError.BadBounds { message = ("tensor " + name) + ": " + err }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Loaders per shape family (layer < 0 selects the top-level name)
-# ---------------------------------------------------------------------------
-
-fn port_vec((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int layer, string suffix) → tensor<f32, [960]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(layer, suffix)
-    const bytes raw ← port_read(source, m, name, port_shape(suffix))
-    const tensor<f32, [960]> t ← port_conv_v960(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_sq((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int layer, string suffix) → tensor<f32, [960, 960]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(layer, suffix)
-    const bytes raw ← port_read(source, m, name, port_shape(suffix))
-    const tensor<f32, [960, 960]> t ← port_conv_m960x960(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_kv((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int layer, string suffix) → tensor<f32, [320, 960]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(layer, suffix)
-    const bytes raw ← port_read(source, m, name, port_shape(suffix))
-    const tensor<f32, [320, 960]> t ← port_conv_m320x960(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_up((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int layer, string suffix) → tensor<f32, [2560, 960]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(layer, suffix)
-    const bytes raw ← port_read(source, m, name, port_shape(suffix))
-    const tensor<f32, [2560, 960]> t ← port_conv_m2560x960(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_down((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int layer, string suffix) → tensor<f32, [960, 2560]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(layer, suffix)
-    const bytes raw ← port_read(source, m, name, port_shape(suffix))
-    const tensor<f32, [960, 2560]> t ← port_conv_m960x2560(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_embed((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m) → tensor<f32, [49152, 960]> ⇥ gguf_manifest.GgufManifestError {
-    const string name ← port_tensor_name(-1, "token_embd.weight")
-    const bytes raw ← port_read(source, m, name, port_shape("token_embd.weight"))
-    const tensor<f32, [49152, 960]> t ← port_conv_m49152x960(raw, name)
-    port_note(name)
-    return t
-}
-
-fn port_layer((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int n) → PortLayer ⇥ gguf_manifest.GgufManifestError {
-    const tensor<f32, [960]> attn_norm ← port_vec(source, m, n, "attn_norm.weight")
-    const tensor<f32, [960, 960]> wq ← port_sq(source, m, n, "attn_q.weight")
-    const tensor<f32, [320, 960]> wk ← port_kv(source, m, n, "attn_k.weight")
-    const tensor<f32, [320, 960]> wv ← port_kv(source, m, n, "attn_v.weight")
-    const tensor<f32, [960, 960]> wo ← port_sq(source, m, n, "attn_output.weight")
-    const tensor<f32, [960]> ffn_norm ← port_vec(source, m, n, "ffn_norm.weight")
-    const tensor<f32, [2560, 960]> wg ← port_up(source, m, n, "ffn_gate.weight")
-    const tensor<f32, [2560, 960]> wu ← port_up(source, m, n, "ffn_up.weight")
-    const tensor<f32, [960, 2560]> wd ← port_down(source, m, n, "ffn_down.weight")
-    return PortLayer { attn_norm = attn_norm, wq = wq, wk = wk, wv = wv, wo = wo, ffn_norm = ffn_norm, wg = wg, wu = wu, wd = wd }
-}
-
-# Every one of the 290 tensors, each read once. `source` is the caller's
-# bounds-checked range reader (absolute file offset, length).
-@ public
-fn load_weights((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m) → PortWeights ⇥ gguf_manifest.GgufManifestError {
-    const tensor<f32, [49152, 960]> embed ← port_embed(source, m)
-    const tensor<f32, [960]> out_norm ← port_vec(source, m, -1, "output_norm.weight")
-    var list<PortLayer> layers ← []
-    var int n ← 0
-    while n ≺ PORT_LAYERS {
-        layers.append(port_layer(source, m, n))
-        n ← n + 1
-    }
-    return PortWeights { embed = embed, out_norm = out_norm, layers = layers }
-}
-
-# ---------------------------------------------------------------------------
-# Tests (pure parts)
-# ---------------------------------------------------------------------------
-
-describe "port weights shape table" tag "inferentia" {
-    test "matrix shapes are the reversed GGUF ne" {
-        assert port_same(port_shape("token_embd.weight"), [49152, 960])
-        assert port_same(port_shape("attn_q.weight"), [960, 960])
-        assert port_same(port_shape("attn_k.weight"), [320, 960])
-        assert port_same(port_shape("attn_v.weight"), [320, 960])
-        assert port_same(port_shape("attn_output.weight"), [960, 960])
-        assert port_same(port_shape("ffn_gate.weight"), [2560, 960])
-        assert port_same(port_shape("ffn_up.weight"), [2560, 960])
-        assert port_same(port_shape("ffn_down.weight"), [960, 2560])
-    }
-    test "norm vectors are [960]" {
-        assert port_same(port_shape("attn_norm.weight"), [960])
-        assert port_same(port_shape("ffn_norm.weight"), [960])
-        assert port_same(port_shape("output_norm.weight"), [960])
-    }
-    test "an unknown suffix has no shape" {
-        assert port_shape("rope_freqs.weight").length() ≡ 0
-    }
-    test "element counts match the stored byte sizes" {
-        assert port_elements(port_shape("token_embd.weight")) * 4 ≡ 188743680
-        assert port_elements(port_shape("ffn_down.weight")) ≡ 2457600
-        assert port_elements(port_shape("attn_norm.weight")) ≡ 960
-    }
-    test "the load covers 290 tensors" {
-        assert port_tensor_count() ≡ 290
-        assert port_layer_suffixes().length() ≡ 9
-    }
-}
-
-describe "port weights name table" tag "inferentia" {
-    test "per-layer names carry the block index" {
-        assert port_tensor_name(0, "attn_q.weight") ≡ "blk.0.attn_q.weight"
-        assert port_tensor_name(31, "ffn_down.weight") ≡ "blk.31.ffn_down.weight"
-    }
-    test "top-level names are bare" {
-        assert port_tensor_name(-1, "token_embd.weight") ≡ "token_embd.weight"
-        assert port_tensor_name(-1, "output_norm.weight") ≡ "output_norm.weight"
-    }
-}
-
-describe "port weights validation" tag "inferentia" {
-    test "reversed ne with type F32 passes" {
-        do {
-            port_check_dims("blk.0.ffn_gate.weight", [960, 2560], 0, [2560, 960])
-            port_check_dims("blk.0.attn_norm.weight", [960], 0, [960])
-            assert true
-        }
-        catch err {
-            assert false
-        }
-    }
-    test "ne in row-major order (not reversed) is refused" {
-        var bool refused ← false
-        do {
-            port_check_dims("blk.0.ffn_gate.weight", [2560, 960], 0, [2560, 960])
-        }
-        catch err {
-            refused ← true
-        }
-        assert refused
-    }
-    test "a wrong dimension is refused" {
-        var bool refused ← false
-        do {
-            port_check_dims("blk.0.attn_k.weight", [960, 321], 0, [320, 960])
-        }
-        catch err {
-            refused ← true
-        }
-        assert refused
-    }
-    test "a wrong rank is refused" {
-        var bool refused ← false
-        do {
-            port_check_dims("blk.0.attn_norm.weight", [960, 1], 0, [960])
-        }
-        catch err {
-            refused ← true
-        }
-        assert refused
-    }
-    test "a non-F32 type is refused as UnknownLayout" {
-        var string cause ← ""
-        do {
-            port_check_dims("blk.0.attn_q.weight", [960, 960], 12, [960, 960])
-        }
-        catch err {
-            cause ← err.message
-        }
-        assert cause ≠ ""
-    }
-    test "an unknown expected shape is refused" {
-        var bool refused ← false
-        do {
-            const list<int> none_expected ← port_shape("rope_freqs.weight")
-            port_check_dims("rope_freqs.weight", [32], 0, none_expected)
-        }
-        catch err {
-            refused ← true
-        }
-        assert refused
-    }
-}
-
-describe "port weights conversion refusal" tag "inferentia" {
-    test "a short byte range is a recoverable BadBounds, not a reshape" {
-        const bytes raw ← |00 00 80 3f|
-        var string cause ← ""
-        do {
-            const tensor<f32, [960]> t ← port_conv_v960(raw, "blk.0.attn_norm.weight")
-            cause ← "converted"
-        }
-        catch err {
-            cause ← err.message
-        }
-        assert cause ≠ ""
-        assert cause ≠ "converted"
-    }
-}
-
-# =============================================================================
-# Port generation — the A1 greedy decode loop on the gradus decode-token launches
-# =============================================================================
-#
-# Given the bulk-loaded `port.PortWeights` (port_weights.fab), the prompt token
-# ids, a new-token ceiling and the stop policy, this module runs
-#
-#   prefill   each prompt token, one at a time, through embed_step + 32 x
-#             layer_step; head_step only after the LAST prompt token
-#   decode    head_step -> host scan of the logits -> the chosen id is appended
-#             and fed back, until an EOG id (stop) or the ceiling (length)
-#
-# The structure is the proven `drive` of radix/acceptance/a1-token-step: per
-# layer weight tensors passed as plain arguments, the K/V caches held as
-# ping-pong pairs `tensor<f32, [C, 320]>` (a tensor cannot be both read and
-# `mut`; the roles swap every token), a run-time cache extent
-# `const size C ← c`, `pos` an i32, and the caches only ever passed to launches
-# (never indexed, flattened or copied on the host). The caches are allocated
-# once per call, so a request owns a fresh pair per layer.
-#
-# The loop itself lives in main.fab (`port_generate`): the device route keeps a
-# generic kernel only when it is reached from the entry module (F-29 below);
-# this module holds the pure parts and their tests.
-#
-# The only per-token host read is the logits vector (a full-vocabulary scan
-# that also yields the top two ids and logits for the trace line).
-#
-# Greedy only. The finish reasons are `stop` (an EOG id was chosen; the EOG id
-# is part of the returned ids, as in the host path) and `length`.
-# =============================================================================
-
-@ public
-class PortResult {
-    var list<int> ids
-    var string finish
-}
-
-@ public
-class PortTop {
-    var int id1
-    var f32 val1
-    var int id2
-    var f32 val2
-}
-
-# ---------------------------------------------------------------------------
-# Pure parts
-# ---------------------------------------------------------------------------
-
-# K/V cache capacity for one request: the context limit, or the prompt plus
-# the new-token ceiling when that is smaller. At least 1.
-@ public
-fn port_capacity(int context, int prompt_len, int max_new) → int {
-    const int want ← prompt_len + max_new
-    var int cap ← want
-    if context ≺ want {
-        cap ← context
-    }
-    if cap ≺ 1 {
-        return 1
-    }
-    return cap
-}
-
-# The finish reason of a run: `stop` when it ended on an EOG id, else `length`.
-@ public
-fn port_finish(bool hit_eog) → string {
-    if hit_eog {
-        return "stop"
-    }
-    return "length"
-}
-
-# Whether the loop ends after choosing a token: an EOG id under the stop
-# policy, the new-token ceiling, or no cache row left to feed the token into.
-@ public
-fn port_ends(bool stop_on_eog, bool is_eog, int generated, int max_new, int next_pos, int capacity) → bool {
-    if stop_on_eog and is_eog {
-        return true
-    }
-    if generated ≥ max_new {
-        return true
-    }
-    return next_pos ≥ capacity
-}
-
-# The oracle trace line for one generated step.
-@ public
-fn port_trace_line(int step, int id, int id1, f32 val1, int id2, f32 val2) → string {
-    return "trace step=" + (step ↦ string) + " id=" + (id ↦ string) + " top1=" + (id1 ↦ string) + ":" + (val1 ↦ string) + " top2=" + (id2 ↦ string) + ":" + (val2 ↦ string)
-}
-
-# int -> i32 outside main is failable; the values here are always in range.
-@ public
-fn port_i32(int x) → i32 {
-    return x ↦ i32 ⊥ (0 ∷ i32)
-}
-
-fn port_skipped(list<int> skip, int id) → bool {
-    return id ∈ skip
-}
-
-# Full-vocabulary scan: the largest and second largest logit (first index
-# wins ties), skipping the ids in `skip` (the EOG ids under ignore_eos).
-@ public
-fn port_scan(tensor<f32, [49152]> logits, list<int> skip) → PortTop {
-    var int id1 ← -1
-    var f32 val1 ← 0.0 ∷ f32
-    var int id2 ← -1
-    var f32 val2 ← 0.0 ∷ f32
-    const bool masked ← skip.length() ≻ 0
-    var int i ← 0
-    while i ≺ 49152 {
-        if masked and port_skipped(skip, i) {
-            i ← i + 1
-        } else {
-            const f32 x ← logits[[i]]
-            if id1 ≺ 0 or x ≻ val1 {
-                id2 ← id1
-                val2 ← val1
-                id1 ← i
-                val1 ← x
-            } elif id2 ≺ 0 or x ≻ val2 {
-                id2 ← i
-                val2 ← x
-            }
-            i ← i + 1
-        }
-    }
-    return PortTop { id1 = id1, val1 = val1, id2 = id2, val2 = val2 }
-}
-
-# ---------------------------------------------------------------------------
-# Helpers of the decode loop (the loop itself is `port_generate` in main.fab)
-# ---------------------------------------------------------------------------
-
-@ public
-fn port_progress(string text) → void {
-    console.warn_line("port: " + text)
-}
-
-# The masked set for the choice: empty under the stop policy (nothing is
-# skipped), the EOG ids under ignore_eos.
-@ public
-fn if_skip(bool stop_on_eog, list<int> eog_ids) → list<int> {
-    if stop_on_eog {
-        return []
-    }
-    return eog_ids
-}
-
-# ---------------------------------------------------------------------------
-# Tests (pure parts)
-# ---------------------------------------------------------------------------
-
-describe "port generate capacity" tag "inferentia" {
-    test "capacity is the prompt plus the ceiling when that fits the context" {
-        assert port_capacity(8192, 25, 64) ≡ 89
-        assert port_capacity(8192, 9, 32) ≡ 41
-    }
-    test "capacity is clamped to the context limit" {
-        assert port_capacity(50, 25, 64) ≡ 50
-    }
-    test "capacity is at least one row" {
-        assert port_capacity(0, 0, 0) ≡ 1
-    }
-}
-
-describe "port generate stop policy" tag "inferentia" {
-    test "finish reasons are stop and length" {
-        assert port_finish(true) ≡ "stop"
-        assert port_finish(false) ≡ "length"
-    }
-    test "an EOG id ends the run under the stop policy" {
-        assert port_ends(true, true, 2, 32, 11, 41)
-    }
-    test "an EOG id does not end the run under ignore_eos" {
-        assert not port_ends(false, true, 2, 32, 11, 41)
-    }
-    test "the ceiling ends the run" {
-        assert port_ends(true, false, 32, 32, 41, 100)
-    }
-    test "a full cache ends the run" {
-        assert port_ends(true, false, 3, 32, 41, 41)
-    }
-    test "an ordinary token continues" {
-        assert not port_ends(true, false, 3, 32, 12, 41)
-    }
-    test "the masked set is empty under the stop policy" {
-        assert if_skip(true, [2, 0]).length() ≡ 0
-        assert if_skip(false, [2, 0]).length() ≡ 2
-    }
-}
-
-describe "port generate trace line" tag "inferentia" {
-    test "the line carries the step, the chosen id and the top two logits" {
-        assert port_trace_line(0, 30, 30, 12.5 ∷ f32, 1270, 9.25 ∷ f32) ≡ "trace step=0 id=30 top1=30:12.5 top2=1270:9.25"
-    }
-}
-
-describe "port generate scan" tag "inferentia" {
-    test "the scan picks the top two with the first index winning ties" {
-        var tensor<f32, [49152]> t ← tf32[49152] {}
-        t[[7]] ← 3.0 ∷ f32
-        t[[9]] ← 3.0 ∷ f32
-        t[[40000]] ← 1.0 ∷ f32
-        const PortTop top ← port_scan(t, [])
-        assert top.id1 ≡ 7
-        assert top.id2 ≡ 9
-    }
-    test "skipped ids never win" {
-        var tensor<f32, [49152]> t ← tf32[49152] {}
-        t[[7]] ← 5.0 ∷ f32
-        t[[9]] ← 3.0 ∷ f32
-        t[[11]] ← 2.0 ∷ f32
-        const PortTop top ← port_scan(t, [7])
-        assert top.id1 ≡ 9
-        assert top.id2 ≡ 11
-    }
-}
+import from "./port_generate" pgen
+import from "./port_weights" port
 
 # ---------------------------------------------------------------------------
 # Serve configuration (D1 syntax + D2 precedence)
@@ -2426,9 +1753,9 @@ fn load_resident_model(string path, string sha, string expected_digest) → Resi
 # literal-shape tensor (`raw ↦ tensor<f32, [N, K]> via Le`). `path` and the
 # bounds-checked `live_range` are the byte source; the shapes, names and the
 # BadBounds/UnknownLayout refusals live in port_weights.fab.
-fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → PortWeights ⇥ gguf_manifest.GgufManifestError {
+fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf_manifest.GgufManifestError {
     const int total ← live_file_size(path)
-    return load_weights(
+    return port.load_weights(
         (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(path, total, initium, longitudo),
         admitted
     )
@@ -2438,7 +1765,7 @@ fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → PortW
 # check_materialized_digest sequence as load_resident_model (the file is
 # re-digested after admission and must equal the admitted sha and the
 # operator pin before any weight is read), then load_port_weights.
-fn load_port_model(string path, string sha, string expected_digest) → PortWeights ⇥ gguf.GgufError {
+fn load_port_model(string path, string sha, string expected_digest) → port.PortWeights ⇥ gguf.GgufError {
     const gguf_manifest.GgufManifest admitted ← inspect_model(path, sha)
     var string materialized ← ""
     do {
@@ -2476,118 +1803,6 @@ fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.
     )
 }
 
-# Greedy generation. `prompt` must hold at least one id and fewer than
-# `context`; `max_new` >= 1; the caller validates both (main.fab). `eog_ids` is
-# the admitted tokenizer's EOG set; with `stop_on_eog` false the EOG ids are
-# masked out of the choice (the ignore_eos policy).
-fn port_generate(PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace) → PortResult {
-    const int np ← prompt.length()
-    const int c ← port_capacity(context, np, max_new)
-    const size C ← c
-    const i32 pd ← port_i32(960)
-    const i32 pqd ← port_i32(960)
-    const i32 pf ← port_i32(2560)
-    const i32 pdh ← port_i32(64)
-    const i32 pspan ← port_i32(32)
-    const i32 pgroup ← port_i32(3)
-    # The GGUF q/k weights are stored for llama.cpp's NORM rope (consecutive pairs
-    # (2p, 2p + 1)): rope convention 1 (gradus `rope_pairs`), weights used as stored.
-    const i32 prope ← port_i32(1)
-    const i32 pc ← port_i32(c)
-    const f32 eps ← 0.00001 ∷ f32
-    const f32 lntheta ← 11.512925 ∷ f32
-    const f32 attscale ← 0.125 ∷ f32
-
-    var list<tensor<f32, [C, 320]>> ka ← empty
-    var list<tensor<f32, [C, 320]>> kb ← empty
-    var list<tensor<f32, [C, 320]>> va ← empty
-    var list<tensor<f32, [C, 320]>> vb ← empty
-    var int l ← 0
-    while l ≺ PORT_LAYERS {
-        var tensor<f32, [C, 320]> c1 ← tf32[C, 320] {}
-        var tensor<f32, [C, 320]> c2 ← tf32[C, 320] {}
-        var tensor<f32, [C, 320]> c3 ← tf32[C, 320] {}
-        var tensor<f32, [C, 320]> c4 ← tf32[C, 320] {}
-        ka.append(c1)
-        kb.append(c2)
-        va.append(c3)
-        vb.append(c4)
-        l ← l + 1
-    }
-
-    const tensor<f32, [49152, 960]> emb ← w.embed
-    const tensor<f32, [960]> onorm ← w.out_norm
-    var tensor<f32, [15]> hdom ← tf32[15] {}
-    var tensor<i32, [1]> ids ← tensor<i32, [1]> {}
-    var tensor<f32, [49152]> logits ← tf32[49152] {}
-    var list<int> out ← []
-    var string finish ← "length"
-    var bool done ← false
-    var int t ← 0
-    var int cur ← prompt.get(0) coalesce 0
-    var i32 pos ← 0
-    const list<int> skip ← if_skip(stop_on_eog, eog_ids)
-    port_progress("prefill-start prompt=" + (np ↦ string) + " capacity=" + (c ↦ string))
-    while not done {
-        ids[0] ← port_i32(cur)
-        var tensor<f32, [960]> hcur ← tf32[960] {}
-        dt.embed_step(emb, ids, mut hcur)
-        var int ll ← 0
-        while ll ≺ PORT_LAYERS {
-            const PortLayer pl ← w.layers[ll]
-            const tensor<f32, [960]> lan ← pl.attn_norm
-            const tensor<f32, [960, 960]> lq ← pl.wq
-            const tensor<f32, [320, 960]> lk ← pl.wk
-            const tensor<f32, [320, 960]> lv ← pl.wv
-            const tensor<f32, [960, 960]> lo ← pl.wo
-            const tensor<f32, [960]> lfn ← pl.ffn_norm
-            const tensor<f32, [2560, 960]> lg ← pl.wg
-            const tensor<f32, [2560, 960]> lu ← pl.wu
-            const tensor<f32, [960, 2560]> ld ← pl.wd
-            var tensor<f32, [960]> hn ← tf32[960] {}
-            var tensor<f32, [C, 320]> kin ← ka[ll]
-            var tensor<f32, [C, 320]> kout ← kb[ll]
-            var tensor<f32, [C, 320]> vin ← va[ll]
-            var tensor<f32, [C, 320]> vout ← vb[ll]
-            if t % 2 ≡ 1 {
-                kin ← kb[ll]
-                kout ← ka[ll]
-                vin ← vb[ll]
-                vout ← va[ll]
-            }
-            dt.layer_step(hdom, hcur, mut hn, lan, lq, lk, lv, lo, lfn, lg, lu, ld, kin, mut kout, vin, mut vout, pos, pd, pqd, pf, pc, pdh, pspan, pgroup, eps, lntheta, attscale, prope)
-            hcur ← hn
-            ll ← ll + 1
-        }
-        if t ≥ np - 1 {
-            dt.head_step(hcur, onorm, emb, mut logits, pd, eps)
-            const PortTop top ← port_scan(logits, skip)
-            const int chosen ← top.id1
-            const int step ← out.length()
-            out.append(chosen)
-            if trace {
-                console.warn_line(port_trace_line(step, chosen, top.id1, top.val1, top.id2, top.val2))
-            }
-            if step ≡ 0 {
-                port_progress("decode-start")
-            }
-            const bool hit ← stop_on_eog and (chosen ∈ eog_ids)
-            if port_ends(stop_on_eog, chosen ∈ eog_ids, out.length(), max_new, t + 1, c) {
-                done ← true
-                finish ← port_finish(hit)
-            } else {
-                cur ← chosen
-            }
-        } else {
-            cur ← prompt.get(t + 1) coalesce 0
-        }
-        t ← t + 1
-        pos ← pos + 1
-    }
-    port_progress("decode-done tokens=" + (out.length() ↦ string))
-    return PortResult { ids = out, finish = finish }
-}
-
 # The metal backend decodes greedily (the decode-token launches pick the
 # largest logit on the host); a sampled request is refused with a request-side
 # cause (400) rather than silently decoded greedily.
@@ -2605,7 +1820,7 @@ fn port_greedy_refusal(GenerateConfig cfg) → string ∪ none {
 # fit causes as generate_dense_with_stop) followed by the greedy decode
 # loop. A fresh pair of K/V caches is allocated per call inside
 # port_generate; the weights are the resident ones.
-fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, PortWeights weights, decoder.StopPolicy stop, bool trace) → PortResult ⇥ config.GenerationError {
+fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace) → pgen.PortResult ⇥ config.GenerationError {
     const config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
     const string ∪ none refusal ← port_greedy_refusal(cfg)
     if refusal not is none {
@@ -2614,17 +1829,17 @@ fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, Por
     require ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig { message = "needs at least one prompt token" }
     require ids.length() ≤ g.max_prompt throw variant config.GenerationError.InvalidConfig { message = "prompt length exceeds max_prompt" }
     require ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig { message = "prompt length does not fit context" }
-    return port_generate(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace)
+    return pgen.port_generate(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace)
 }
 
 # One generate dispatch for the request path: the port weights list is empty on
 # the cpu backend (the host path) and holds the single resident weights on
 # metal.
-fn generate_tokens(GenerateConfig cfg, list<int> ids, ResidentModel model, list<PortWeights> ports, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+fn generate_tokens(GenerateConfig cfg, list<int> ids, ResidentModel model, list<port.PortWeights> ports, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
     if ports.length() ≡ 0 {
         return run_generate(cfg, ids, model, stop)
     }
-    const PortResult res ← run_generate_port(cfg, ids, model, ports[0], stop, false)
+    const pgen.PortResult res ← run_generate_port(cfg, ids, model, ports[0], stop, false)
     return res.ids
 }
 
@@ -2646,7 +1861,7 @@ fn port_resident(gguf_manifest.GgufManifest admitted) → ResidentModel {
     }
 }
 
-fn print_port_result(tokenizator.Tokenizer tok, PortResult res) → void {
+fn print_port_result(tokenizator.Tokenizer tok, pgen.PortResult res) → void {
     stdout_write("ids=" + live_ids_flat(res.ids) + "\n")
     stdout_write("text=" + live_decode(tok, res.ids) + "\n")
     stdout_write("finish=" + res.finish + "\n")
@@ -2669,13 +1884,13 @@ fn live_run_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManifes
     }
     const decoder.StopPolicy stop ← live_stop_policy(serve_config.ignore_eos)
     stderr_write("port: load-start\n")
-    const PortWeights weights ← live_load_port(serve_config, sha)
+    const port.PortWeights weights ← live_load_port(serve_config, sha)
     stderr_write("port: load-done\n")
-    const PortResult res ← live_port_generate(cfg, prompt_ids, model, weights, stop, serve_config.trace)
+    const pgen.PortResult res ← live_port_generate(cfg, prompt_ids, model, weights, stop, serve_config.trace)
     print_port_result(tok, res)
 }
 
-fn live_load_port(ServeConfig serve_config, string sha) → PortWeights {
+fn live_load_port(ServeConfig serve_config, string sha) → port.PortWeights {
     do {
         return load_port_model(serve_config.model, sha, serve_config.expected_digest)
     }
@@ -2684,7 +1899,7 @@ fn live_load_port(ServeConfig serve_config, string sha) → PortWeights {
     }
 }
 
-fn live_port_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, PortWeights weights, decoder.StopPolicy stop, bool trace) → PortResult {
+fn live_port_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace) → pgen.PortResult {
     do {
         return run_generate_port(cfg, ids, model, weights, stop, trace)
     }
@@ -3097,7 +2312,7 @@ fn prompt_of_length(int n) → string {
 # decode with the admitted tokenizer EOG stop set and the max_tokens budget)
 # → response assembly. Domain validation (the gradus reject rows) is enforced
 # by the engine with typed causes; this unit maps them to 400/500.
-fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeConfig config, ResidentModel model, list<PortWeights> ports) → void {
+fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeConfig config, ResidentModel model, list<port.PortWeights> ports) → void {
     # Method gate: /generate is POST (D3).
     if incoming.req.method ≠ "POST" {
         reply_json(incoming, 400, error_body("method must be POST for /generate"))
@@ -3173,7 +2388,7 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
 
 # Respond to one request carrier. /health is always 200 once the listener is
 # up; /generate is the U4 endpoint; any other path is 404 (D3).
-fn handle_request(value request, ServerState st, ServeConfig config, ResidentModel model, list<PortWeights> ports) → void {
+fn handle_request(value request, ServerState st, ServeConfig config, ResidentModel model, list<port.PortWeights> ports) → void {
     if request is map<string, value> {
         const server.Incoming incoming ← server.incoming_of(request)
         const string path ← incoming.req.path
@@ -3204,8 +2419,8 @@ fn accept_loop_step(bool serving, string err) → bool {
 
 # Serve's single resident port load: the weights wrapped in a one-element list
 # (the cpu backend passes an empty list, so no placeholder weights exist).
-fn port_serve_load(ServeConfig config, string sha) → list<PortWeights> ⇥ gguf.GgufError {
-    const PortWeights weights ← load_port_model(config.model, sha, config.expected_digest)
+fn port_serve_load(ServeConfig config, string sha) → list<port.PortWeights> ⇥ gguf.GgufError {
+    const port.PortWeights weights ← load_port_model(config.model, sha, config.expected_digest)
     return [weights]
 }
 
@@ -3246,7 +2461,7 @@ fn serve(ServeConfig config) → void {
     # load_resident_model re-verifies the digest at materialization, so a
     # file swapped between admit and load throws into the failed state here.
     var ResidentModel resident ← empty_resident()
-    var list<PortWeights> ports ← []
+    var list<port.PortWeights> ports ← []
     if state.state ≡ "ready" and config.backend ≡ "metal" {
         # The metal backend loads the bulk port weights ONCE here (digest-bound,
         # same admit -> re-digest sequence) and warms the launches with a one-token
