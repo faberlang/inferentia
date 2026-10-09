@@ -81,3 +81,20 @@ Decode (64-token run, instrumented): 187 ms/token (5.35 tok/s), 676 launches/tok
 about 44 percent is the interpreted logits scan, about 43 percent of the main thread
 waits on Metal command-buffer completion triggered by buffer release. Peak RSS 7.4 GB.
 Digest: 5.5 s per pass (software SHA-256, 261 MB/s) against 0.76 s with hardware SHA.
+
+Update 2026-10-09 (A1RECHECK, release `faber`, radix `2d770fb48`, gradus `5fde315`,
+inferentia `9f2c7b2`; the other tables above are the 2026-10-08 starting point):
+
+| Phase (eog case) | s |
+| --- | --- |
+| Front end | 11.1 (6.9 on the continuation run; varies by run) |
+| Admit + digest + manifest + tokenizer | 2.0 |
+| Load | 1.0 |
+| Prefill (9 tokens) | 3.5 |
+| Wall | 17.8 |
+
+Continuation (64 tokens): wall 21.4 s, decode 6.7 s (about 105 ms/token averaged by the
+oracle script; the instrumented non-trace figure was 72 ms/token). Serve smoke 20.2 s
+(health ready at 10.1 s). Port-load gate 16.5 s. Peak RSS 7.4 GB. The admit drop
+(18.3 -> 2.0 s) is the GGUF manifest byte helpers (BULKBYTES) plus the hardware SHA-256
+and the single manifest parse. What remains is the front end (10 s) and prefill.
