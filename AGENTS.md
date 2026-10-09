@@ -59,3 +59,25 @@ Model-serving stages must record the exact model path, size, hash, GGUF
 metadata, command, request fixture, observed output, and comparison oracle.
 Do not start long model or integration runs without making their expected cost
 clear first.
+
+## Measured baselines
+
+A1 oracle path, `faber run --device metal inferentia -- live --backend metal`, eog case,
+SmolLM2-360M-Instruct-f32 (1.45 GB), quiet M5 Max, release `faber`, 3 runs
+(2026-10-08; radix `91e1b5947`, inferentia `2acf1cead`, gradus `27b282921`).
+Full analysis and the ranked list: `../radix/docs/factory/gpu-reset/a1-perf-baseline.md`
+(open defect F-33).
+
+| Phase | min (s) | median (s) |
+| --- | --- | --- |
+| Front end (analyze 5.7 + MIR lowering/validation about 58) | 64.8 | 64.8 |
+| Admit + digest + manifest + tokenizer | 35.3 | 35.5 |
+| Tokenize + `port_resident` (second tokenizer build) | 4.7 | 4.7 |
+| Load (third manifest parse + second digest + tensors 0.5) | 19.5 | 19.5 |
+| Prefill, 9 tokens (includes first-use weight upload) | 5.1 | 5.2 |
+| Wall | 129.6 | 130.0 |
+
+Decode (64-token run, instrumented): 187 ms/token (5.35 tok/s), 676 launches/token;
+about 44 percent is the interpreted logits scan, about 43 percent of the main thread
+waits on Metal command-buffer completion triggered by buffer release. Peak RSS 7.4 GB.
+Digest: 5.5 s per pass (software SHA-256, 261 MB/s) against 0.76 s with hardware SHA.
