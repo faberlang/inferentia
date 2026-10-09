@@ -72,7 +72,6 @@ import from "gradus:generation/config" config
 import from "gradus:generation/decoder" decoder
 import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
-import from "gradus:model/capsule" capsule
 import from "gradus:model/dense" dense
 import from "gradus:model/gguf" gguf
 import from "gradus:model/gguf_manifest" gguf_manifest
@@ -1056,12 +1055,19 @@ fn check_admission_size(int observed) → string ∪ none {
     return null
 }
 
+# The admitted digest plus the manifest gradus inspected while admitting it:
+# the header is parsed once, here, and the manifest is passed on.
+class AdmittedModel {
+    var string sha
+    var gguf_manifest.GgufManifest manifest
+}
+
 # Path → host stat + digest + header prefix → gradus admit. Returns the carried
-# digest. The stat runs first and the ceiling gate refuses an over-ceiling path
+# digest and the inspected manifest (identity {sha-256, digest, artifact length}). The stat runs first and the ceiling gate refuses an over-ceiling path
 # before anything is read (G1-U8); only the header prefix [0, data offset) is
 # read, never the tensor data, and the stat length is the artifact length the
 # digest covers.
-fn admit_model(string path) → string ⇥ gguf.GgufError {
+fn admit_model(string path) → AdmittedModel ⇥ gguf.GgufError {
     var string digest ← ""
     var list<u8> prefix ← []
     var int observed ← 0
@@ -1083,8 +1089,8 @@ fn admit_model(string path) → string ⇥ gguf.GgufError {
     if size_refusal not is none {
         throw variant BadCapsule { message = size_refusal coalesce "" }
     }
-    const capsule.Capsule cap ← gguf.admit(prefix, digest, observed, pinned_expect_file_type(), pinned_expect_pad_id(), pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
-    return cap.digest()
+    const gguf.Admission admission ← gguf.admit_with_manifest(prefix, digest, observed, pinned_expect_file_type(), pinned_expect_pad_id(), pinned_expect_kv(), pinned_expect_tensors(), pinned_expect_elements(), pinned_expect_f32(), pinned_expect_q4k(), pinned_expect_q5(), pinned_expect_q6(), pinned_expect_q8())
+    return AdmittedModel { sha = admission.cap.digest(), manifest = admission.manifest }
 }
 
 fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.GenerationConfig ⇥ config.GenerationError {
@@ -1964,8 +1970,11 @@ fn live_run(ServeConfig serve_config) → void {
     stdout_write("model.path=" + serve_config.model + "\n")
 
     var string sha ← ""
+    var gguf_manifest.GgufManifest admitted ← empty_manifest()
     do {
-        sha ← admit_model(serve_config.model)
+        const AdmittedModel am ← admit_model(serve_config.model)
+        sha ← am.sha
+        admitted ← am.manifest
     }
     catch err {
         panic "admit failed: " + err.message
@@ -1978,7 +1987,6 @@ fn live_run(ServeConfig serve_config) → void {
     const int total ← live_file_size(serve_config.model)
     stdout_write("model.bytes=" + (total ↦ string) + "\n")
 
-    const gguf_manifest.GgufManifest admitted ← inspect_model(serve_config.model, sha)
     stdout_write("manifest.data_offset=" + (admitted.data_start ↦ string) + "\n")
 
     const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
@@ -2486,8 +2494,11 @@ fn serve(ServeConfig config) → void {
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
+    var gguf_manifest.GgufManifest served_manifest ← empty_manifest()
     do {
-        const string sha ← admit_model(state.model_path)
+        const AdmittedModel am ← admit_model(state.model_path)
+        const string sha ← am.sha
+        served_manifest ← am.manifest
         const string ∪ none pin_refusal ← check_pinned_digest(sha)
         if pin_refusal not is none {
             throw variant BadCapsule { message = pin_refusal coalesce "" }
@@ -2518,9 +2529,8 @@ fn serve(ServeConfig config) → void {
         # admit digest, re-digested at load, length guarded) and warms the launches with a one-token
         # generation; every /generate reuses them with a fresh cache pair.
         do {
-            const gguf_manifest.GgufManifest admitted_manifest ← inspect_model(state.model_path, state.sha256)
-            ports ← port_serve_load(config, state.sha256, admitted_manifest)
-            resident ← port_resident(admitted_manifest, live_build_tokenizer(admitted_manifest))
+            ports ← port_serve_load(config, state.sha256, served_manifest)
+            resident ← port_resident(served_manifest, live_build_tokenizer(served_manifest))
             stderr_write("inferentia: model loaded once (resident, metal) - generation ready\n")
         }
         catch err {

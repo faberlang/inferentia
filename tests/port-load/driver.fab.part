@@ -10,8 +10,11 @@ fn driver_cell(string label, f32 x) → void {
 fn port_driver(ServeConfig config) → void {
     stderr_write("driver: start\n")
     var string sha ← ""
+    var gguf_manifest.GgufManifest admitted ← empty_manifest()
     do {
-        sha ← admit_model(config.model)
+        const AdmittedModel am ← admit_model(config.model)
+        sha ← am.sha
+        admitted ← am.manifest
     }
     catch err {
         panic "admit failed: " + err.message
@@ -21,8 +24,6 @@ fn port_driver(ServeConfig config) → void {
         panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
     }
     stdout_write("sha.admitted=" + sha + "\n")
-    const gguf_manifest.GgufManifest admitted ← inspect_model(config.model, sha)
-    stderr_write("driver: inspect-done\n")
     var string materialized ← ""
     do {
         materialized ← host_digestio(config.model)
