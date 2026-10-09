@@ -21,8 +21,8 @@
 # The loop is `port_generate` below; the pure parts it uses are above it and
 # are covered by the tests at the end of the pure section.
 #
-# The only per-token host read is the logits vector (a full-vocabulary scan
-# that also yields the top two ids and logits for the trace line).
+# The only per-token host read is the logits vector: the native argmax, or under
+# `trace` the full-vocabulary scan that also yields the top two ids and logits.
 #
 # Greedy only. The finish reasons are `stop` (an EOG id was chosen; the EOG id
 # is part of the returned ids, as in the host path) and `length`.
@@ -135,6 +135,28 @@ fn port_scan(tensor<f32, [49152]> logits, list<int> skip) → PortTop {
     return PortTop { id1 = id1, val1 = val1, id2 = id2, val2 = val2 }
 }
 
+# Sets the ids in `skip` (the EOG ids under ignore_eos) to the lowest f32, so
+# they never win the argmax. Overwrites `logits`: the caller's next head_step
+# rewrites the whole vector.
+@ public
+fn port_mask(mut tensor<f32, [49152]> logits, list<int> skip) → void {
+    const f32 lowest ← -3.4028235e38 ∷ f32
+    var int k ← 0
+    while k ≺ skip.length() {
+        logits[[skip.get(k) coalesce 0]] ← lowest
+        k ← k + 1
+    }
+}
+
+# The greedy choice without the trace evidence: the native argmax of the host
+# logits (the lowest index wins ties, as in `port_scan` and llama.cpp's greedy
+# sampler). Not `mut`: a `return reduce` over a `mut` parameter is rejected at
+# run time (invalid MIR, no-value return), so the masking is `port_mask`.
+@ public
+fn port_argmax(tensor<f32, [49152]> logits) → int {
+    return reduce via argmax from logits at [i] coalesce 0
+}
+
 # ---------------------------------------------------------------------------
 # Helpers of the decode loop (the loop itself is `port_generate` below)
 # ---------------------------------------------------------------------------
@@ -200,6 +222,24 @@ describe "port generate stop policy" tag "inferentia" {
 describe "port generate trace line" tag "inferentia" {
     test "the line carries the step, the chosen id and the top two logits" {
         assert port_trace_line(0, 30, 30, 12.5 ∷ f32, 1270, 9.25 ∷ f32) ≡ "trace step=0 id=30 top1=30:12.5 top2=1270:9.25"
+    }
+}
+
+describe "port generate argmax" tag "inferentia" {
+    test "the native argmax picks the largest with the first index winning ties" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[7]] ← 3.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        t[[40000]] ← 1.0 ∷ f32
+        port_mask(mut t, [])
+        assert port_argmax(t) ≡ 7
+    }
+    test "skipped ids never win the native argmax" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[7]] ← 5.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        port_mask(mut t, [7])
+        assert port_argmax(t) ≡ 9
     }
 }
 
@@ -310,13 +350,17 @@ fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eo
         }
         if t ≥ np - 1 {
             dt.head_step(hcur, onorm, emb, mut logits, pd, eps)
-            const PortTop top ← port_scan(logits, skip)
-            const int chosen ← top.id1
+            var int chosen ← 0
             const int step ← out.length()
-            out.append(chosen)
             if trace {
+                const PortTop top ← port_scan(logits, skip)
+                chosen ← top.id1
                 console.warn_line(port_trace_line(step, chosen, top.id1, top.val1, top.id2, top.val2))
+            } else {
+                port_mask(mut logits, skip)
+                chosen ← port_argmax(logits)
             }
+            out.append(chosen)
             if step ≡ 0 {
                 port_progress("decode-start")
             }
